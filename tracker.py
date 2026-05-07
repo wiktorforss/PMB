@@ -106,11 +106,6 @@ def get_api(url, params=None, retries=3):
 
 
 def fetch_leaderboard():
-    """
-    Polymarket has no public leaderboard endpoint.
-    Instead we grab top holders from the most active markets
-    and use those wallets as our 'smart money' list.
-    """
     # Get top active markets by volume
     markets = get_api(f"{GAMMA_API}/markets", {
         "closed": "false",
@@ -123,19 +118,34 @@ def fetch_leaderboard():
 
     wallets = set()
     for market in markets[:5]:
-        condition_id = market.get("conditionId", "")
-        if not condition_id:
+        # holders endpoint needs the token asset ID, not conditionId
+        # each market has clobTokenIds — a list of token IDs for Yes/No
+        token_ids = market.get("clobTokenIds", "[]")
+        if isinstance(token_ids, str):
+            import json as _json
+            try:
+                token_ids = _json.loads(token_ids)
+            except Exception:
+                continue
+
+        # Just use the first token (Yes side)
+        if not token_ids:
             continue
+
+        token_id = token_ids[0]
+
         holders = get_api(f"{DATA_API}/holders", {
-            "conditionId": condition_id,
+            "market": token_id,
             "limit": 20,
         })
         if not isinstance(holders, list):
             continue
+
         for h in holders:
             w = h.get("proxyWallet") or h.get("address", "")
             if w:
                 wallets.add(w)
+
         time.sleep(CFG["request_delay_s"])
 
     log.info(f"Wallets gathered from top market holders: {len(wallets)}")
