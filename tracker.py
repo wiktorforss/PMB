@@ -37,8 +37,8 @@ CFG = {
     "lb_refresh_s":      int(os.getenv("LB_REFRESH_S", "900")),     # refresh every 15 min
 
     # Polling
-    "poll_interval_s":   int(os.getenv("POLL_INTERVAL_S", "300")),  # scan every 5 min
-    "request_delay_s": float(os.getenv("REQUEST_DELAY_S", "0.5")), # delay between wallet calls
+    "poll_interval_s":   int(os.getenv("POLL_INTERVAL_S", "60")),  # scan every 5 min
+    "request_delay_s": float(os.getenv("REQUEST_DELAY_S", "0.1")), # delay between wallet calls
 
     # Signal detection
     "min_overlap":       int(os.getenv("MIN_OVERLAP", "2")),
