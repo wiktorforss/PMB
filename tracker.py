@@ -104,15 +104,27 @@ def get_api(url, params=None, retries=3):
 
 # ─── Leaderboard ──────────────────────────────────────────────────────────────
 def fetch_leaderboard():
+    # Try primary endpoint
     data = get_api(f"{DATA_API}/leaderboard", {
         "window": CFG["leaderboard_window"],
         "limit": CFG["leaderboard_limit"],
-        "sortBy": "PROFIT",
     })
+
+    # Fallback — some versions use /rankings
+    if not data:
+        data = get_api(f"{DATA_API}/rankings", {
+            "window": CFG["leaderboard_window"],
+            "limit": CFG["leaderboard_limit"],
+        })
+
     if not data:
         return []
-    wallets = [u.get("proxyWallet") or u.get("address", "") for u in data
-               if u.get("proxyWallet") or u.get("address")]
+
+    wallets = [
+        u.get("proxyWallet") or u.get("address") or u.get("wallet", "")
+        for u in data
+        if u.get("proxyWallet") or u.get("address") or u.get("wallet")
+    ]
     log.info(f"Leaderboard fetched: {len(wallets)} wallets")
     return wallets
 
