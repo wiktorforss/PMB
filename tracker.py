@@ -26,14 +26,14 @@ log = logging.getLogger(__name__)
 # ─── Config (from env vars — set these in Railway dashboard) ──────────────────
 CFG = {
     "leaderboard_window":          os.getenv("LEADERBOARD_WINDOW", "7d"),
-    "leaderboard_limit":       int(os.getenv("LEADERBOARD_LIMIT", "50")),
+    "leaderboard_limit":       int(os.getenv("LEADERBOARD_LIMIT", "75")),
     "leaderboard_refresh_s":   int(os.getenv("LEADERBOARD_REFRESH_S", "900")),
     "poll_interval_s":         int(os.getenv("POLL_INTERVAL_S", "300")),
     "request_delay_s":       float(os.getenv("REQUEST_DELAY_S", "0.5")),
-    "min_overlap":             int(os.getenv("MIN_OVERLAP", "3")),
+    "min_overlap":             int(os.getenv("MIN_OVERLAP", "2")),
     "min_position_usd":      float(os.getenv("MIN_POSITION_USD", "100")),
     "max_entry_price":       float(os.getenv("MAX_ENTRY_PRICE", "0.85")),
-    "notify_threshold":        int(os.getenv("NOTIFY_THRESHOLD", "3")),
+    "notify_threshold":        int(os.getenv("NOTIFY_THRESHOLD", "2")),
     "telegram_token":              os.getenv("TELEGRAM_TOKEN", ""),
     "telegram_chat_id":            os.getenv("TELEGRAM_CHAT_ID", ""),
     "autobuy_enabled":             os.getenv("AUTOBUY_ENABLED", "false").lower() == "true",
@@ -112,7 +112,7 @@ def fetch_leaderboard():
     # Get top active markets
     markets = get_api(f"{GAMMA_API}/markets", {
         "closed": "false",
-        "limit": 10,
+        "limit": 15,
         "order": "volumeNum",
         "ascending": "false",
     })
@@ -128,7 +128,7 @@ def fetch_leaderboard():
         # /trades is confirmed in the official docs
         trades = get_api(f"{DATA_API}/trades", {
             "market": condition_id,
-            "limit": 50,
+            "limit": 75,
             "taker_only": "true",
         })
         if not isinstance(trades, list):
@@ -148,7 +148,7 @@ def fetch_leaderboard():
 
 # ─── Positions ────────────────────────────────────────────────────────────────
 def fetch_positions(wallet):
-    data = get_api(f"{DATA_API}/positions", {"user": wallet, "sizeThreshold": 10})
+    data = get_api(f"{DATA_API}/positions", {"user": wallet, "sizeThreshold": 15})
     return data if isinstance(data, list) else []
 
 
