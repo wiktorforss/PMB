@@ -338,6 +338,10 @@ def polling_loop():
 # ─── Entry point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     log.info("Starting Polymarket Smart Money Tracker on Railway...")
-    t = threading.Thread(target=polling_loop, daemon=True)
-    t.start()
+    try:
+        t = threading.Thread(target=polling_loop, daemon=True)
+        t.start()
+        log.info("Polling thread started OK")
+    except Exception as e:
+        log.error(f"Thread failed to start: {e}")
     app.run(host="0.0.0.0", port=CFG["port"])
