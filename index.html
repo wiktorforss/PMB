@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PMB</title>
+<title>PMB — Polymarket Brain</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -36,7 +36,6 @@
     overflow-x: hidden;
   }
 
-  /* Grid texture */
   body::before {
     content: '';
     position: fixed; inset: 0;
@@ -47,7 +46,6 @@
     pointer-events: none; z-index: 0;
   }
 
-  /* Ambient glow */
   body::after {
     content: '';
     position: fixed;
@@ -58,7 +56,6 @@
     pointer-events: none; z-index: 0;
   }
 
-  /* ── Header ── */
   header {
     position: sticky; top: 0; z-index: 100;
     background: rgba(6,6,8,0.85);
@@ -74,28 +71,30 @@
   }
 
   .logo-mark {
-    width: 28px; height: 28px;
+    width: 34px; height: 34px;
+    background: linear-gradient(135deg, rgba(0,232,122,0.15), rgba(0,232,122,0.03));
     border: 1.5px solid var(--green);
-    border-radius: 6px;
+    border-radius: 8px;
     display: flex; align-items: center; justify-content: center;
-    font-size: 14px;
-    box-shadow: 0 0 12px rgba(0,232,122,0.2), inset 0 0 8px rgba(0,232,122,0.05);
+    font-family: var(--mono); font-size: 11px; font-weight: 700;
+    color: var(--green); letter-spacing: 0.02em;
+    box-shadow: 0 0 16px rgba(0,232,122,0.12);
   }
 
-  .logo-text {
-    font-size: 13px; font-weight: 700;
-    letter-spacing: 0.08em; text-transform: uppercase;
-    color: #fff;
+  .logo-name {
+    font-size: 16px; font-weight: 800;
+    letter-spacing: 0.1em; text-transform: uppercase;
+    color: #fff; line-height: 1;
   }
 
   .logo-sub {
     font-family: var(--mono);
-    font-size: 10px; color: var(--muted);
-    letter-spacing: 0.05em;
+    font-size: 9px; color: var(--muted);
+    letter-spacing: 0.08em; margin-top: 3px;
   }
 
   .header-right {
-    display: flex; align-items: center; gap: 20px;
+    display: flex; align-items: center; gap: 16px;
   }
 
   .status-pill {
@@ -107,12 +106,12 @@
   .dot {
     width: 7px; height: 7px; border-radius: 50%;
     background: var(--muted);
-    transition: background 0.3s, box-shadow 0.3s;
+    transition: background 0.3s;
+    flex-shrink: 0;
   }
 
   .dot.live {
     background: var(--green);
-    box-shadow: 0 0 8px var(--green), 0 0 0 0 rgba(0,232,122,0.4);
     animation: ping 2s ease-out infinite;
   }
 
@@ -122,14 +121,12 @@
     100% { box-shadow: 0 0 0 0 rgba(0,232,122,0); }
   }
 
-  /* ── Layout ── */
   .wrap {
     position: relative; z-index: 1;
     max-width: 960px; margin: 0 auto;
-    padding: 32px 20px 80px;
+    padding: 32px 20px 60px;
   }
 
-  /* ── Stats bar ── */
   .stats {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
@@ -159,8 +156,7 @@
 
   .stat-value {
     font-family: var(--mono); font-size: 22px;
-    color: #fff; font-weight: 700;
-    line-height: 1;
+    color: #fff; font-weight: 700; line-height: 1;
   }
 
   .stat-value.green { color: var(--green); }
@@ -171,7 +167,6 @@
     color: var(--muted); margin-top: 6px;
   }
 
-  /* ── Toolbar ── */
   .toolbar {
     display: flex; align-items: center; gap: 8px;
     margin-bottom: 18px; flex-wrap: wrap;
@@ -201,7 +196,6 @@
     color: var(--muted);
   }
 
-  /* ── Signal card ── */
   .signal-list { display: flex; flex-direction: column; gap: 10px; }
 
   .signal {
@@ -214,10 +208,7 @@
     animation: fadeUp 0.4s ease both;
   }
 
-  .signal:hover {
-    background: var(--surface2);
-    border-color: var(--border2);
-  }
+  .signal:hover { background: var(--surface2); border-color: var(--border2); }
 
   @keyframes fadeUp {
     from { opacity: 0; transform: translateY(10px); }
@@ -233,14 +224,12 @@
     flex-shrink: 0;
     font-family: var(--mono); font-size: 10px; font-weight: 700;
     border-radius: 6px; padding: 4px 9px;
-    letter-spacing: 0.04em;
-    border: 1px solid;
-    white-space: nowrap;
+    letter-spacing: 0.04em; border: 1px solid; white-space: nowrap;
   }
 
   .badge.hot  { color: var(--green); background: var(--green-dim); border-color: rgba(0,232,122,0.25); }
   .badge.warm { color: var(--amber); background: var(--amber-dim); border-color: rgba(255,182,64,0.25); }
-  .badge.cool { color: #8888aa;      background: rgba(136,136,170,0.1); border-color: rgba(136,136,170,0.2); }
+  .badge.cool { color: #8888aa; background: rgba(136,136,170,0.1); border-color: rgba(136,136,170,0.2); }
 
   .signal-info { flex: 1; min-width: 0; }
 
@@ -263,12 +252,8 @@
   .outcome-tag.yes { color: var(--green); background: var(--green-dim); border-color: rgba(0,232,122,0.2); }
   .outcome-tag.no  { color: var(--red);   background: var(--red-dim);   border-color: rgba(255,61,107,0.2); }
 
-  .meta-item {
-    font-family: var(--mono); font-size: 10px; color: var(--muted);
-  }
-
+  .meta-item { font-family: var(--mono); font-size: 10px; color: var(--muted); }
   .meta-item span { color: var(--text); }
-
   .pnl-pos { color: var(--green) !important; }
   .pnl-neg { color: var(--red) !important; }
 
@@ -280,18 +265,13 @@
 
   .chevron.open { transform: rotate(180deg); }
 
-  /* Strength bar */
-  .signal-bar {
-    height: 2px;
-    background: rgba(255,255,255,0.04);
-  }
+  .signal-bar { height: 2px; background: rgba(255,255,255,0.04); }
 
   .signal-bar-fill {
     height: 100%; border-radius: 1px;
     transition: width 0.8s cubic-bezier(0.34, 1.56, 0.64, 1);
   }
 
-  /* Expanded holders */
   .holders-panel {
     display: none;
     padding: 0 18px 16px;
@@ -330,10 +310,8 @@
 
   .poly-link:hover { opacity: 1; }
 
-  /* ── Empty / Loading states ── */
   .state-box {
-    text-align: center; padding: 60px 20px;
-    color: var(--muted);
+    text-align: center; padding: 60px 20px; color: var(--muted);
   }
 
   .state-box .icon { font-size: 32px; margin-bottom: 16px; }
@@ -343,45 +321,27 @@
     letter-spacing: 0.05em; line-height: 1.8;
   }
 
-  /* ── Setup banner ── */
-  .setup-banner {
-    margin-top: 28px;
-    background: rgba(77,159,255,0.05);
-    border: 1px solid rgba(77,159,255,0.15);
-    border-radius: 10px; padding: 18px 22px;
+  .footer {
+    position: fixed; bottom: 0; left: 0; right: 0;
+    height: 36px;
+    background: rgba(6,6,8,0.95);
+    border-top: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center;
+    gap: 24px;
+    font-family: var(--mono); font-size: 9px;
+    color: var(--muted); letter-spacing: 0.08em;
+    z-index: 50;
   }
-
-  .setup-banner h3 {
-    font-family: var(--mono); font-size: 11px;
-    letter-spacing: 0.1em; text-transform: uppercase;
-    color: var(--blue); margin-bottom: 10px;
-  }
-
-  .setup-banner p {
-    font-family: var(--mono); font-size: 11px;
-    color: var(--muted); line-height: 1.9;
-  }
-
-  code {
-    background: rgba(255,255,255,0.06);
-    border: 1px solid var(--border);
-    border-radius: 4px; padding: 1px 6px;
-    font-family: var(--mono); font-size: 10px; color: var(--text);
-  }
-
-  /* ── Refresh animation ── */
-  @keyframes spin { to { transform: rotate(360deg); } }
-  .spinning { display: inline-block; animation: spin 1s linear infinite; }
 </style>
 </head>
 <body>
 
 <header>
   <div class="logo">
-    <div class="logo-mark">◈</div>
+    <div class="logo-mark">PMB</div>
     <div>
-      <div class="logo-text">Smart Money</div>
-      <div class="logo-sub">Polymarket Leaderboard Tracker</div>
+      <div class="logo-name">PMB</div>
+      <div class="logo-sub">Polymarket Brain</div>
     </div>
   </div>
   <div class="header-right">
@@ -395,22 +355,21 @@
 
 <div class="wrap">
 
-  <!-- Stats -->
   <div class="stats">
     <div class="stat">
       <div class="stat-label">Wallets tracked</div>
       <div class="stat-value" id="statWallets">—</div>
-      <div class="stat-sub" id="statWindow">leaderboard</div>
+      <div class="stat-sub" id="statWindow">from top markets</div>
     </div>
     <div class="stat">
       <div class="stat-label">Active signals</div>
       <div class="stat-value amber" id="statSignals">—</div>
-      <div class="stat-sub" id="statOverlap">≥3 traders overlap</div>
+      <div class="stat-sub" id="statOverlap">≥2 traders overlap</div>
     </div>
     <div class="stat">
       <div class="stat-label">Combined value</div>
       <div class="stat-value green" id="statValue">—</div>
-      <div class="stat-sub">all overlapping positions</div>
+      <div class="stat-sub">overlapping positions</div>
     </div>
     <div class="stat">
       <div class="stat-label">Scans run</div>
@@ -419,7 +378,6 @@
     </div>
   </div>
 
-  <!-- Toolbar -->
   <div class="toolbar">
     <button class="filter-btn active" data-filter="all">All</button>
     <button class="filter-btn" data-filter="hot">🔥 Hot (5+)</button>
@@ -428,42 +386,27 @@
     <span class="result-count" id="resultCount"></span>
   </div>
 
-  <!-- Signals -->
   <div class="signal-list" id="signalList">
     <div class="state-box">
       <div class="icon">⟳</div>
-      <p>Connecting to tracker...<br>Make sure your Railway deployment is live.</p>
+      <p>PMB is connecting...<br>Scanning active markets for smart money signals.</p>
     </div>
   </div>
 
-  <!-- Setup note (shown until live) -->
-  <div class="setup-banner" id="setupBanner" style="display:none">
-    <h3>📡 Not connected</h3>
-    <p>
-      Set your Railway URL below, then deploy <code>tracker.py</code> to Railway.<br>
-      Once live, this dashboard auto-refreshes every 30 seconds.
-    </p>
-  </div>
+</div>
 
-  <!-- Railway URL config -->
-  
-    
+<div class="footer">
+  <span>PMB — Polymarket Brain</span>
+  <span id="footerScans">— scans</span>
+  <span id="footerWallets">— wallets</span>
+</div>
 
 <script>
-// ─── Config ───────────────────────────────────────────────────────────────────
-let RAILWAY_URL = localStorage.getItem('railway_url') || 'https://pmb-production-a6bd.up.railway.app';
+const RAILWAY_URL = 'https://pmb-production-a6bd.up.railway.app';
 let activeFilter = 'all';
 let allOverlaps = [];
-let isLive = false;
-let refreshTimer = null;
 
-// ─── Init ─────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
-  if (RAILWAY_URL) {
-    document.getElementById('railwayUrl').value = RAILWAY_URL;
-  }
-
-  // Filter buttons
   document.querySelectorAll('.filter-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
@@ -474,24 +417,10 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   fetchData();
-  refreshTimer = setInterval(fetchData, 30000);
+  setInterval(fetchData, 30000);
 });
 
-function saveUrl() {
-  const val = document.getElementById('railwayUrl').value.trim().replace(/\/$/, '');
-  if (!val) return;
-  RAILWAY_URL = val;
-  localStorage.setItem('railway_url', val);
-  fetchData();
-}
-
-// ─── Fetch ────────────────────────────────────────────────────────────────────
 async function fetchData() {
-  if (!RAILWAY_URL) {
-    setOffline('Enter your Railway URL below');
-    return;
-  }
-
   try {
     const r = await fetch(`${RAILWAY_URL}/results`, { signal: AbortSignal.timeout(10000) });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -502,9 +431,7 @@ async function fetchData() {
       return;
     }
 
-    isLive = true;
     setStatus('live', 'Live');
-    document.getElementById('setupBanner').style.display = 'none';
     document.getElementById('lastUpdate').style.display = 'flex';
     document.getElementById('lastUpdate').textContent = 'Updated ' + elapsed(data.timestamp);
 
@@ -513,17 +440,16 @@ async function fetchData() {
     renderSignals();
 
   } catch (e) {
-    setOffline('Cannot reach Railway — check deployment');
+    setStatus('offline', 'Reconnecting...');
     console.warn('Fetch error:', e);
   }
 }
 
-// ─── Stats ────────────────────────────────────────────────────────────────────
 function updateStats(data) {
   document.getElementById('statWallets').textContent = data.walletCount ?? '—';
   document.getElementById('statWindow').textContent = (data.config?.leaderboardWindow || '7d') + ' window';
   document.getElementById('statSignals').textContent = allOverlaps.length;
-  document.getElementById('statOverlap').textContent = `≥${data.config?.minOverlap || 3} traders overlap`;
+  document.getElementById('statOverlap').textContent = `≥${data.config?.minOverlap || 2} traders overlap`;
   document.getElementById('statScans').textContent = data.scanCount ?? '—';
 
   const iv = data.config?.pollIntervalS;
@@ -531,14 +457,16 @@ function updateStats(data) {
 
   const total = allOverlaps.reduce((a, s) => a + s.totalValue, 0);
   document.getElementById('statValue').textContent = '$' + fmt(total);
+
+  document.getElementById('footerScans').textContent = `${data.scanCount ?? 0} scans`;
+  document.getElementById('footerWallets').textContent = `${data.walletCount ?? 0} wallets`;
 }
 
-// ─── Render signals ───────────────────────────────────────────────────────────
 function renderSignals() {
   const filtered = allOverlaps.filter(s => {
-    if (activeFilter === 'yes')  return s.outcome.toLowerCase() === 'yes';
-    if (activeFilter === 'no')   return s.outcome.toLowerCase() === 'no';
-    if (activeFilter === 'hot')  return s.holderCount >= 5;
+    if (activeFilter === 'yes') return s.outcome.toLowerCase() === 'yes';
+    if (activeFilter === 'no')  return s.outcome.toLowerCase() === 'no';
+    if (activeFilter === 'hot') return s.holderCount >= 5;
     return true;
   });
 
@@ -551,14 +479,13 @@ function renderSignals() {
     list.innerHTML = `
       <div class="state-box">
         <div class="icon">◌</div>
-        <p>No signals matching this filter.<br>Data refreshes every 30 seconds.</p>
+        <p>No signals yet.<br>PMB scans every 5 min — check back soon.</p>
       </div>`;
     return;
   }
 
   list.innerHTML = filtered.map((s, i) => signalCard(s, i)).join('');
 
-  // Animate strength bars
   setTimeout(() => {
     document.querySelectorAll('.signal-bar-fill').forEach(el => {
       el.style.width = el.dataset.width;
@@ -570,7 +497,6 @@ function signalCard(s, i) {
   const strength = Math.min(s.holderCount / 10, 1);
   const isYes = s.outcome.toLowerCase() === 'yes';
   const pnlPos = s.avgPnl >= 0;
-
   const badgeClass = s.holderCount >= 7 ? 'hot' : s.holderCount >= 5 ? 'warm' : 'cool';
   const barColor = s.holderCount >= 7 ? 'var(--green)' : s.holderCount >= 5 ? 'var(--amber)' : '#555';
 
@@ -622,20 +548,11 @@ function toggleCard(el) {
   chevron.classList.toggle('open', open);
 }
 
-// ─── Status helpers ───────────────────────────────────────────────────────────
 function setStatus(type, text) {
-  const dot = document.getElementById('statusDot');
-  const label = document.getElementById('statusText');
-  dot.className = 'dot' + (type === 'live' ? ' live' : '');
-  label.textContent = text;
+  document.getElementById('statusDot').className = 'dot' + (type === 'live' ? ' live' : '');
+  document.getElementById('statusText').textContent = text;
 }
 
-function setOffline(reason) {
-  setStatus('offline', reason);
-  document.getElementById('setupBanner').style.display = 'block';
-}
-
-// ─── Formatters ───────────────────────────────────────────────────────────────
 const fmt = n => (n ?? 0).toLocaleString('en-US', { maximumFractionDigits: 0 });
 const fmtCents = n => (n * 100).toFixed(1) + '¢';
 const fmtPct = n => (n >= 0 ? '+' : '') + (n ?? 0).toFixed(1) + '%';
