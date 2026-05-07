@@ -1,11 +1,11 @@
 """
 PMB — Polymarket Brain
 Railway Edition: Flask API + background polling loop.
-- Fetches active wallets from top market trades
-- Detects overlapping positions across wallets
+- Fetches wallets from the REAL Polymarket leaderboard (/v1/leaderboard)
+- Detects overlapping positions across top traders
 - Sends Telegram alerts ONCE per signal per day
 - Persists triggered signals to disk — restarts won't cause repeats
-- Resets triggered list daily so genuinely new signals re-alert
+- Resets triggered list daily so new signals re-alert
 """
 
 import os
@@ -29,28 +29,39 @@ log = logging.getLogger(__name__)
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 CFG = {
-    "leaderboard_window":        os.getenv("LEADERBOARD_WINDOW", "7d"),
-    "leaderboard_limit":     int(os.getenv("LEADERBOARD_LIMIT", "75")),
-    "leaderboard_refresh_s": int(os.getenv("LEADERBOARD_REFRESH_S", "900")),
-    "poll_interval_s":       int(os.getenv("POLL_INTERVAL_S", "300")),
-    "request_delay_s":     float(os.getenv("REQUEST_DELAY_S", "0.5")),
-    "min_overlap":           int(os.getenv("MIN_OVERLAP", "2")),
-    "min_position_usd":    float(os.getenv("MIN_POSITION_USD", "100")),
-    "max_entry_price":     float(os.getenv("MAX_ENTRY_PRICE", "0.85")),
-    "notify_threshold":      int(os.getenv("NOTIFY_THRESHOLD", "2")),
-    "telegram_token":            os.getenv("TELEGRAM_TOKEN", ""),
-    "telegram_chat_id":          os.getenv("TELEGRAM_CHAT_ID", ""),
-    "autobuy_enabled":           os.getenv("AUTOBUY_ENABLED", "false").lower() == "true",
+    # Leaderboard
+    "lb_time_period":        os.getenv("LB_TIME_PERIOD", "WEEK"),   # DAY, WEEK, MONTH, ALL
+    "lb_order_by":           os.getenv("LB_ORDER_BY", "PNL"),       # PNL, VOL
+    "lb_limit":          int(os.getenv("LB_LIMIT", "50")),          # max 50
+    "lb_category":           os.getenv("LB_CATEGORY", "OVERALL"),   # OVERALL, CRYPTO, POLITICS etc
+    "lb_refresh_s":      int(os.getenv("LB_REFRESH_S", "900")),     # refresh every 15 min
+
+    # Polling
+    "poll_interval_s":   int(os.getenv("POLL_INTERVAL_S", "300")),  # scan every 5 min
+    "request_delay_s": float(os.getenv("REQUEST_DELAY_S", "0.5")), # delay between wallet calls
+
+    # Signal detection
+    "min_overlap":       int(os.getenv("MIN_OVERLAP", "2")),
+    "min_position_usd": float(os.getenv("MIN_POSITION_USD", "100")),
+    "max_entry_price":  float(os.getenv("MAX_ENTRY_PRICE", "0.85")),
+
+    # Notifications
+    "notify_threshold":  int(os.getenv("NOTIFY_THRESHOLD", "2")),
+    "telegram_token":        os.getenv("TELEGRAM_TOKEN", ""),
+    "telegram_chat_id":      os.getenv("TELEGRAM_CHAT_ID", ""),
+
+    # Auto-buy (disabled by default)
+    "autobuy_enabled":       os.getenv("AUTOBUY_ENABLED", "false").lower() == "true",
     "autobuy_min_overlap":   int(os.getenv("AUTOBUY_MIN_OVERLAP", "5")),
     "autobuy_max_price":   float(os.getenv("AUTOBUY_MAX_PRICE", "0.70")),
     "autobuy_size_usd":    float(os.getenv("AUTOBUY_SIZE_USD", "10")),
     "autobuy_daily_limit": float(os.getenv("AUTOBUY_DAILY_LIMIT", "50")),
-    "private_key":               os.getenv("POLYMARKET_PRIVATE_KEY", ""),
-    "port":                  int(os.getenv("PORT", "8080")),
+    "private_key":             os.getenv("POLYMARKET_PRIVATE_KEY", ""),
+
+    "port":              int(os.getenv("PORT", "8080")),
 }
 
-DATA_API  = "https://data-api.polymarket.com"
-GAMMA_API = "https://gamma-api.polymarket.com"
+DATA_API = "https://data-api.polymarket.com"
 
 TRIGGERED_FILE = Path("triggered.json")
 
@@ -61,7 +72,7 @@ def load_triggered() -> dict:
     """
     Load triggered signals from disk.
     Format: { "date": "YYYY-MM-DD", "keys": ["conditionId|outcome", ...] }
-    If the saved date is not today, returns a fresh empty store.
+    If saved date is not today, returns a fresh empty store.
     """
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if TRIGGERED_FILE.exists():
@@ -72,7 +83,6 @@ def load_triggered() -> dict:
                 return data
         except Exception as e:
             log.warning(f"Could not read triggered.json: {e}")
-    # New day or missing file — start fresh
     return {"date": today, "keys": []}
 
 
@@ -95,17 +105,16 @@ def maybe_reset_triggered(store: dict) -> dict:
 
 # ─── Shared state ─────────────────────────────────────────────────────────────
 _lock = threading.Lock()
-
-_triggered_store = load_triggered()  # { date, keys: [] }
+_triggered_store = load_triggered()
 
 _state = {
-    "results":           None,
-    "leaderboard":       [],
-    "daily_spend":       0.0,
-    "daily_spend_date":  "",
-    "last_lb_fetch":     0,
-    "scan_count":        0,
-    "started_at":        datetime.now(timezone.utc).isoformat(),
+    "results":          None,
+    "leaderboard":      [],
+    "daily_spend":      0.0,
+    "daily_spend_date": "",
+    "last_lb_fetch":    0,
+    "scan_count":       0,
+    "started_at":       datetime.now(timezone.utc).isoformat(),
 }
 
 # ─── Flask app ────────────────────────────────────────────────────────────────
@@ -151,52 +160,42 @@ def get_api(url, params=None, retries=3):
     return None
 
 
-# ─── Wallet collection ────────────────────────────────────────────────────────
-def fetch_leaderboard():
+# ─── Leaderboard ──────────────────────────────────────────────────────────────
+def fetch_leaderboard() -> list[str]:
     """
-    Collect active wallet addresses by pulling recent trades
-    from the top volume markets via the confirmed /trades endpoint.
+    Fetch top traders from the official Polymarket leaderboard endpoint.
+    Returns a list of proxyWallet addresses.
     """
-    markets = get_api(f"{GAMMA_API}/markets", {
-        "closed":     "false",
-        "limit":      15,
-        "order":      "volumeNum",
-        "ascending":  "false",
+    data = get_api(f"{DATA_API}/v1/leaderboard", {
+        "timePeriod": CFG["lb_time_period"],
+        "orderBy":    CFG["lb_order_by"],
+        "limit":      CFG["lb_limit"],
+        "category":   CFG["lb_category"],
     })
-    if not markets:
+
+    if not isinstance(data, list) or len(data) == 0:
+        log.warning("Leaderboard returned no data")
         return []
 
-    wallets = set()
-    for market in markets[:8]:
-        condition_id = market.get("conditionId", "")
-        if not condition_id:
-            continue
+    wallets = [
+        entry.get("proxyWallet", "")
+        for entry in data
+        if entry.get("proxyWallet", "").startswith("0x")
+    ]
 
-        trades = get_api(f"{DATA_API}/trades", {
-            "market":     condition_id,
-            "limit":      75,
-            "taker_only": "true",
-        })
-        if not isinstance(trades, list):
-            continue
+    log.info(f"Leaderboard fetched: {len(wallets)} wallets "
+             f"(period={CFG['lb_time_period']}, orderBy={CFG['lb_order_by']})")
 
-        if trades:
-            log.debug(f"Trade keys: {list(trades[0].keys())}")
+    # Log top 5 for visibility
+    for entry in data[:5]:
+        log.info(f"  #{entry.get('rank')} {entry.get('userName', 'anon')} "
+                 f"PnL=${entry.get('pnl', 0):,.0f} Vol=${entry.get('vol', 0):,.0f}")
 
-        for t in trades:
-            w = (t.get("maker") or t.get("taker") or
-                 t.get("proxyWallet") or t.get("transactorAddress", ""))
-            if w and w.startswith("0x"):
-                wallets.add(w)
-
-        time.sleep(CFG["request_delay_s"])
-
-    log.info(f"Wallets gathered from recent trades: {len(wallets)}")
-    return list(wallets)
+    return wallets
 
 
 # ─── Positions ────────────────────────────────────────────────────────────────
-def fetch_positions(wallet):
+def fetch_positions(wallet: str) -> list:
     data = get_api(f"{DATA_API}/positions", {
         "user":          wallet,
         "sizeThreshold": 15,
@@ -205,7 +204,7 @@ def fetch_positions(wallet):
 
 
 # ─── Overlap detection ────────────────────────────────────────────────────────
-def detect_overlaps(wallets):
+def detect_overlaps(wallets: list[str]) -> list[dict]:
     market_holders = defaultdict(list)
 
     for i, wallet in enumerate(wallets):
@@ -259,7 +258,7 @@ def detect_overlaps(wallets):
 
 
 # ─── Telegram ─────────────────────────────────────────────────────────────────
-def notify(signal):
+def notify(signal: dict):
     token   = CFG["telegram_token"]
     chat_id = CFG["telegram_chat_id"]
     if not token or not chat_id:
@@ -273,7 +272,7 @@ def notify(signal):
         f"🎯 *PMB Signal*\n\n"
         f"{emoji} *{signal['title']}*\n"
         f"Outcome: *{signal['outcome']}* @ `{signal['curPrice']:.3f}`\n\n"
-        f"👥 *{signal['holderCount']} traders in this position*\n"
+        f"👥 *{signal['holderCount']} top traders in this position*\n"
         f"💰 Combined: `${signal['totalValue']:,.0f}`\n"
         f"{pnl_emoji} Avg PnL: `{signal['avgPnl']:.1f}%`\n\n"
         f"🔗 [View on Polymarket]({url})"
@@ -294,7 +293,7 @@ def notify(signal):
 
 
 # ─── Auto-buy ─────────────────────────────────────────────────────────────────
-def attempt_autobuy(signal):
+def attempt_autobuy(signal: dict) -> bool:
     if not CFG["autobuy_enabled"]:
         return False
 
@@ -357,31 +356,31 @@ def polling_loop():
     while True:
         now = time.time()
 
-        # ── Daily reset check ──────────────────────────────────────────────────
+        # Daily reset check
         with _lock:
             _triggered_store = maybe_reset_triggered(_triggered_store)
 
-        # ── Refresh wallet list ────────────────────────────────────────────────
+        # Refresh leaderboard
         with _lock:
             last_lb = _state["last_lb_fetch"]
             wallets = _state["leaderboard"]
 
-        if now - last_lb > CFG["leaderboard_refresh_s"]:
+        if now - last_lb > CFG["lb_refresh_s"]:
             new_wallets = fetch_leaderboard()
             if new_wallets:
                 with _lock:
-                    _state["leaderboard"]  = new_wallets
+                    _state["leaderboard"]   = new_wallets
                     _state["last_lb_fetch"] = now
                 wallets = new_wallets
 
         if not wallets:
-            log.info("Waiting for wallets...")
+            log.info("Waiting for leaderboard wallets...")
             time.sleep(30)
             continue
 
-        # ── Scan positions ─────────────────────────────────────────────────────
+        # Scan positions
         if now - last_positions_poll >= CFG["poll_interval_s"]:
-            log.info(f"Scanning {len(wallets)} wallets...")
+            log.info(f"Scanning {len(wallets)} leaderboard wallets...")
             overlaps = detect_overlaps(wallets)
 
             with _lock:
@@ -394,32 +393,29 @@ def polling_loop():
                     "config": {
                         "minOverlap":        CFG["min_overlap"],
                         "pollIntervalS":     CFG["poll_interval_s"],
-                        "leaderboardWindow": CFG["leaderboard_window"],
+                        "leaderboardWindow": CFG["lb_time_period"],
                     },
                 }
 
             log.info(f"Scan #{_state['scan_count']}: {len(overlaps)} signals found")
 
-            # ── Notify + auto-buy ──────────────────────────────────────────────
+            # Notify + auto-buy
             for signal in overlaps:
                 key = f"{signal['conditionId']}|{signal['outcome']}"
 
                 with _lock:
-                    already_triggered = key in _triggered_store["keys"]
+                    already = key in _triggered_store["keys"]
 
-                if already_triggered:
-                    continue  # Already notified today — skip entirely
+                if already:
+                    continue
 
                 # New signal — notify
                 if signal["holderCount"] >= CFG["notify_threshold"]:
                     notify(signal)
-
-                    # Mark as triggered and persist to disk immediately
                     with _lock:
                         _triggered_store["keys"].append(key)
                         save_triggered(_triggered_store)
-
-                    log.info(f"Marked as triggered: {signal['title']} ({signal['outcome']})")
+                    log.info(f"Triggered: {signal['title']} ({signal['outcome']})")
 
                 # Auto-buy if enabled
                 if (CFG["autobuy_enabled"]
