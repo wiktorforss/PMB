@@ -46,7 +46,7 @@ CFG = {
 }
 
 DATA_API = "https://data-api.polymarket.com"
-
+GAMMA_API = "https://gamma-api.polymarket.com"
 # ─── Shared state (thread-safe via lock) ─────────────────────────────────────
 _lock = threading.Lock()
 _state = {
@@ -103,30 +103,43 @@ def get_api(url, params=None, retries=3):
 
 
 # ─── Leaderboard ──────────────────────────────────────────────────────────────
+
+
 def fetch_leaderboard():
-    # Try primary endpoint
-    data = get_api(f"{DATA_API}/leaderboard", {
-        "window": CFG["leaderboard_window"],
-        "limit": CFG["leaderboard_limit"],
+    """
+    Polymarket has no public leaderboard endpoint.
+    Instead we grab top holders from the most active markets
+    and use those wallets as our 'smart money' list.
+    """
+    # Get top active markets by volume
+    markets = get_api(f"{GAMMA_API}/markets", {
+        "closed": "false",
+        "limit": 10,
+        "order": "volumeNum",
+        "ascending": "false",
     })
-
-    # Fallback — some versions use /rankings
-    if not data:
-        data = get_api(f"{DATA_API}/rankings", {
-            "window": CFG["leaderboard_window"],
-            "limit": CFG["leaderboard_limit"],
-        })
-
-    if not data:
+    if not markets:
         return []
 
-    wallets = [
-        u.get("proxyWallet") or u.get("address") or u.get("wallet", "")
-        for u in data
-        if u.get("proxyWallet") or u.get("address") or u.get("wallet")
-    ]
-    log.info(f"Leaderboard fetched: {len(wallets)} wallets")
-    return wallets
+    wallets = set()
+    for market in markets[:5]:
+        condition_id = market.get("conditionId", "")
+        if not condition_id:
+            continue
+        holders = get_api(f"{DATA_API}/holders", {
+            "conditionId": condition_id,
+            "limit": 20,
+        })
+        if not isinstance(holders, list):
+            continue
+        for h in holders:
+            w = h.get("proxyWallet") or h.get("address", "")
+            if w:
+                wallets.add(w)
+        time.sleep(CFG["request_delay_s"])
+
+    log.info(f"Wallets gathered from top market holders: {len(wallets)}")
+    return list(wallets)
 
 
 # ─── Positions ────────────────────────────────────────────────────────────────
