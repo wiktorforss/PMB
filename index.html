@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Polymarket — Smart Money Tracker</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #060608;
+    --surface: #0d0d12;
+    --surface2: #13131a;
+    --border: rgba(255,255,255,0.06);
+    --border2: rgba(255,255,255,0.1);
+    --text: #c8c8d4;
+    --muted: #4a4a5e;
+    --green: #00e87a;
+    --green-dim: rgba(0,232,122,0.12);
+    --red: #ff3d6b;
+    --red-dim: rgba(255,61,107,0.12);
+    --amber: #ffb640;
+    --amber-dim: rgba(255,182,64,0.12);
+    --blue: #4d9fff;
+    --mono: 'Space Mono', monospace;
+    --sans: 'Syne', sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Grid texture */
+  body::before {
+    content: '';
+    position: fixed; inset: 0;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.015) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.015) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none; z-index: 0;
+  }
+
+  /* Ambient glow */
+  body::after {
+    content: '';
+    position: fixed;
+    top: -200px; left: 50%;
+    transform: translateX(-50%);
+    width: 600px; height: 400px;
+    background: radial-gradient(ellipse, rgba(0,232,122,0.04) 0%, transparent 70%);
+    pointer-events: none; z-index: 0;
+  }
+
+  /* ── Header ── */
+  header {
+    position: sticky; top: 0; z-index: 100;
+    background: rgba(6,6,8,0.85);
+    backdrop-filter: blur(20px);
+    border-bottom: 1px solid var(--border);
+    padding: 0 24px;
+    height: 60px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+
+  .logo {
+    display: flex; align-items: center; gap: 12px;
+  }
+
+  .logo-mark {
+    width: 28px; height: 28px;
+    border: 1.5px solid var(--green);
+    border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px;
+    box-shadow: 0 0 12px rgba(0,232,122,0.2), inset 0 0 8px rgba(0,232,122,0.05);
+  }
+
+  .logo-text {
+    font-size: 13px; font-weight: 700;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    color: #fff;
+  }
+
+  .logo-sub {
+    font-family: var(--mono);
+    font-size: 10px; color: var(--muted);
+    letter-spacing: 0.05em;
+  }
+
+  .header-right {
+    display: flex; align-items: center; gap: 20px;
+  }
+
+  .status-pill {
+    display: flex; align-items: center; gap: 7px;
+    font-family: var(--mono); font-size: 10px;
+    color: var(--muted); letter-spacing: 0.05em;
+  }
+
+  .dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--muted);
+    transition: background 0.3s, box-shadow 0.3s;
+  }
+
+  .dot.live {
+    background: var(--green);
+    box-shadow: 0 0 8px var(--green), 0 0 0 0 rgba(0,232,122,0.4);
+    animation: ping 2s ease-out infinite;
+  }
+
+  @keyframes ping {
+    0%   { box-shadow: 0 0 0 0 rgba(0,232,122,0.5); }
+    70%  { box-shadow: 0 0 0 8px rgba(0,232,122,0); }
+    100% { box-shadow: 0 0 0 0 rgba(0,232,122,0); }
+  }
+
+  /* ── Layout ── */
+  .wrap {
+    position: relative; z-index: 1;
+    max-width: 960px; margin: 0 auto;
+    padding: 32px 20px 80px;
+  }
+
+  /* ── Stats bar ── */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+    margin-bottom: 28px;
+  }
+
+  @media (max-width: 640px) {
+    .stats { grid-template-columns: repeat(2, 1fr); }
+  }
+
+  .stat {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+    transition: border-color 0.2s;
+  }
+
+  .stat:hover { border-color: var(--border2); }
+
+  .stat-label {
+    font-family: var(--mono); font-size: 9px;
+    letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 10px;
+  }
+
+  .stat-value {
+    font-family: var(--mono); font-size: 22px;
+    color: #fff; font-weight: 700;
+    line-height: 1;
+  }
+
+  .stat-value.green { color: var(--green); }
+  .stat-value.amber { color: var(--amber); }
+
+  .stat-sub {
+    font-family: var(--mono); font-size: 9px;
+    color: var(--muted); margin-top: 6px;
+  }
+
+  /* ── Toolbar ── */
+  .toolbar {
+    display: flex; align-items: center; gap: 8px;
+    margin-bottom: 18px; flex-wrap: wrap;
+  }
+
+  .filter-btn {
+    font-family: var(--mono); font-size: 10px;
+    letter-spacing: 0.06em; text-transform: uppercase;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--muted); border-radius: 6px;
+    padding: 6px 12px; cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .filter-btn:hover { border-color: var(--border2); color: var(--text); }
+
+  .filter-btn.active {
+    background: rgba(255,255,255,0.07);
+    border-color: rgba(255,255,255,0.2);
+    color: #fff;
+  }
+
+  .result-count {
+    margin-left: auto;
+    font-family: var(--mono); font-size: 10px;
+    color: var(--muted);
+  }
+
+  /* ── Signal card ── */
+  .signal-list { display: flex; flex-direction: column; gap: 10px; }
+
+  .signal {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    transition: border-color 0.15s, background 0.15s;
+    cursor: pointer;
+    animation: fadeUp 0.4s ease both;
+  }
+
+  .signal:hover {
+    background: var(--surface2);
+    border-color: var(--border2);
+  }
+
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(10px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .signal-head {
+    padding: 16px 18px;
+    display: flex; gap: 14px; align-items: flex-start;
+  }
+
+  .badge {
+    flex-shrink: 0;
+    font-family: var(--mono); font-size: 10px; font-weight: 700;
+    border-radius: 6px; padding: 4px 9px;
+    letter-spacing: 0.04em;
+    border: 1px solid;
+    white-space: nowrap;
+  }
+
+  .badge.hot  { color: var(--green); background: var(--green-dim); border-color: rgba(0,232,122,0.25); }
+  .badge.warm { color: var(--amber); background: var(--amber-dim); border-color: rgba(255,182,64,0.25); }
+  .badge.cool { color: #8888aa;      background: rgba(136,136,170,0.1); border-color: rgba(136,136,170,0.2); }
+
+  .signal-info { flex: 1; min-width: 0; }
+
+  .signal-title {
+    font-size: 14px; font-weight: 600; color: #e8e8f0;
+    margin-bottom: 8px; line-height: 1.4;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+
+  .signal-meta {
+    display: flex; gap: 10px; flex-wrap: wrap; align-items: center;
+  }
+
+  .outcome-tag {
+    font-family: var(--mono); font-size: 10px; font-weight: 700;
+    border-radius: 4px; padding: 2px 7px; border: 1px solid;
+    letter-spacing: 0.04em;
+  }
+
+  .outcome-tag.yes { color: var(--green); background: var(--green-dim); border-color: rgba(0,232,122,0.2); }
+  .outcome-tag.no  { color: var(--red);   background: var(--red-dim);   border-color: rgba(255,61,107,0.2); }
+
+  .meta-item {
+    font-family: var(--mono); font-size: 10px; color: var(--muted);
+  }
+
+  .meta-item span { color: var(--text); }
+
+  .pnl-pos { color: var(--green) !important; }
+  .pnl-neg { color: var(--red) !important; }
+
+  .chevron {
+    font-size: 16px; color: var(--muted);
+    transition: transform 0.2s;
+    flex-shrink: 0; margin-top: 2px;
+  }
+
+  .chevron.open { transform: rotate(180deg); }
+
+  /* Strength bar */
+  .signal-bar {
+    height: 2px;
+    background: rgba(255,255,255,0.04);
+  }
+
+  .signal-bar-fill {
+    height: 100%; border-radius: 1px;
+    transition: width 0.8s cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+
+  /* Expanded holders */
+  .holders-panel {
+    display: none;
+    padding: 0 18px 16px;
+    border-top: 1px solid var(--border);
+  }
+
+  .holders-panel.open { display: block; }
+
+  .holders-title {
+    font-family: var(--mono); font-size: 9px; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--muted);
+    padding: 12px 0 8px;
+  }
+
+  .holder-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+    font-family: var(--mono); font-size: 11px;
+  }
+
+  .holder-row:last-of-type { border-bottom: none; }
+
+  .holder-rank { color: var(--muted); width: 18px; text-align: right; flex-shrink: 0; }
+  .holder-wallet { color: #8888aa; flex: 1; }
+  .holder-val { color: var(--text); }
+  .holder-price { color: var(--muted); }
+  .holder-pnl { min-width: 52px; text-align: right; font-weight: 700; }
+
+  .poly-link {
+    display: inline-flex; align-items: center; gap: 5px;
+    margin-top: 12px; font-family: var(--mono); font-size: 10px;
+    color: var(--blue); text-decoration: none; letter-spacing: 0.04em;
+    opacity: 0.8; transition: opacity 0.15s;
+  }
+
+  .poly-link:hover { opacity: 1; }
+
+  /* ── Empty / Loading states ── */
+  .state-box {
+    text-align: center; padding: 60px 20px;
+    color: var(--muted);
+  }
+
+  .state-box .icon { font-size: 32px; margin-bottom: 16px; }
+
+  .state-box p {
+    font-family: var(--mono); font-size: 12px;
+    letter-spacing: 0.05em; line-height: 1.8;
+  }
+
+  /* ── Setup banner ── */
+  .setup-banner {
+    margin-top: 28px;
+    background: rgba(77,159,255,0.05);
+    border: 1px solid rgba(77,159,255,0.15);
+    border-radius: 10px; padding: 18px 22px;
+  }
+
+  .setup-banner h3 {
+    font-family: var(--mono); font-size: 11px;
+    letter-spacing: 0.1em; text-transform: uppercase;
+    color: var(--blue); margin-bottom: 10px;
+  }
+
+  .setup-banner p {
+    font-family: var(--mono); font-size: 11px;
+    color: var(--muted); line-height: 1.9;
+  }
+
+  code {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid var(--border);
+    border-radius: 4px; padding: 1px 6px;
+    font-family: var(--mono); font-size: 10px; color: var(--text);
+  }
+
+  /* ── Refresh animation ── */
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spinning { display: inline-block; animation: spin 1s linear infinite; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-mark">◈</div>
+    <div>
+      <div class="logo-text">Smart Money</div>
+      <div class="logo-sub">Polymarket Leaderboard Tracker</div>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="status-pill">
+      <div class="dot" id="statusDot"></div>
+      <span id="statusText">Connecting...</span>
+    </div>
+    <div class="status-pill" id="lastUpdate" style="display:none"></div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- Stats -->
+  <div class="stats">
+    <div class="stat">
+      <div class="stat-label">Wallets tracked</div>
+      <div class="stat-value" id="statWallets">—</div>
+      <div class="stat-sub" id="statWindow">leaderboard</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Active signals</div>
+      <div class="stat-value amber" id="statSignals">—</div>
+      <div class="stat-sub" id="statOverlap">≥3 traders overlap</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Combined value</div>
+      <div class="stat-value green" id="statValue">—</div>
+      <div class="stat-sub">all overlapping positions</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Scans run</div>
+      <div class="stat-value" id="statScans">—</div>
+      <div class="stat-sub" id="statInterval">every 5 min</div>
+    </div>
+  </div>
+
+  <!-- Toolbar -->
+  <div class="toolbar">
+    <button class="filter-btn active" data-filter="all">All</button>
+    <button class="filter-btn" data-filter="hot">🔥 Hot (5+)</button>
+    <button class="filter-btn" data-filter="yes">YES</button>
+    <button class="filter-btn" data-filter="no">NO</button>
+    <span class="result-count" id="resultCount"></span>
+  </div>
+
+  <!-- Signals -->
+  <div class="signal-list" id="signalList">
+    <div class="state-box">
+      <div class="icon">⟳</div>
+      <p>Connecting to tracker...<br>Make sure your Railway deployment is live.</p>
+    </div>
+  </div>
+
+  <!-- Setup note (shown until live) -->
+  <div class="setup-banner" id="setupBanner" style="display:none">
+    <h3>📡 Not connected</h3>
+    <p>
+      Set your Railway URL below, then deploy <code>tracker.py</code> to Railway.<br>
+      Once live, this dashboard auto-refreshes every 30 seconds.
+    </p>
+  </div>
+
+  <!-- Railway URL config -->
+  <div style="margin-top:24px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+    <input
+      id="railwayUrl"
+      type="text"
+      placeholder="https://your-app.up.railway.app"
+      style="
+        flex:1; min-width:260px;
+        background:var(--surface); border:1px solid var(--border);
+        color:var(--text); border-radius:8px; padding:10px 14px;
+        font-family:var(--mono); font-size:11px;
+        outline:none;
+      "
+    >
+    <button onclick="saveUrl()" style="
+      background:var(--green-dim); border:1px solid rgba(0,232,122,0.3);
+      color:var(--green); border-radius:8px; padding:10px 18px;
+      font-family:var(--mono); font-size:11px; cursor:pointer;
+      letter-spacing:0.05em; text-transform:uppercase;
+      transition:background 0.15s;
+    ">Save & Connect</button>
+  </div>
+
+</div>
+
+<script>
+// ─── Config ───────────────────────────────────────────────────────────────────
+let RAILWAY_URL = localStorage.getItem('railway_url') || '';
+let activeFilter = 'all';
+let allOverlaps = [];
+let isLive = false;
+let refreshTimer = null;
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  if (RAILWAY_URL) {
+    document.getElementById('railwayUrl').value = RAILWAY_URL;
+  }
+
+  // Filter buttons
+  document.querySelectorAll('.filter-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      activeFilter = btn.dataset.filter;
+      renderSignals();
+    });
+  });
+
+  fetchData();
+  refreshTimer = setInterval(fetchData, 30000);
+});
+
+function saveUrl() {
+  const val = document.getElementById('railwayUrl').value.trim().replace(/\/$/, '');
+  if (!val) return;
+  RAILWAY_URL = val;
+  localStorage.setItem('railway_url', val);
+  fetchData();
+}
+
+// ─── Fetch ────────────────────────────────────────────────────────────────────
+async function fetchData() {
+  if (!RAILWAY_URL) {
+    setOffline('Enter your Railway URL below');
+    return;
+  }
+
+  try {
+    const r = await fetch(`${RAILWAY_URL}/results`, { signal: AbortSignal.timeout(10000) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+
+    if (data.status === 'loading') {
+      setStatus('loading', 'First scan running...');
+      return;
+    }
+
+    isLive = true;
+    setStatus('live', 'Live');
+    document.getElementById('setupBanner').style.display = 'none';
+    document.getElementById('lastUpdate').style.display = 'flex';
+    document.getElementById('lastUpdate').textContent = 'Updated ' + elapsed(data.timestamp);
+
+    allOverlaps = data.overlaps || [];
+    updateStats(data);
+    renderSignals();
+
+  } catch (e) {
+    setOffline('Cannot reach Railway — check deployment');
+    console.warn('Fetch error:', e);
+  }
+}
+
+// ─── Stats ────────────────────────────────────────────────────────────────────
+function updateStats(data) {
+  document.getElementById('statWallets').textContent = data.walletCount ?? '—';
+  document.getElementById('statWindow').textContent = (data.config?.leaderboardWindow || '7d') + ' window';
+  document.getElementById('statSignals').textContent = allOverlaps.length;
+  document.getElementById('statOverlap').textContent = `≥${data.config?.minOverlap || 3} traders overlap`;
+  document.getElementById('statScans').textContent = data.scanCount ?? '—';
+
+  const iv = data.config?.pollIntervalS;
+  if (iv) document.getElementById('statInterval').textContent = `every ${iv/60} min`;
+
+  const total = allOverlaps.reduce((a, s) => a + s.totalValue, 0);
+  document.getElementById('statValue').textContent = '$' + fmt(total);
+}
+
+// ─── Render signals ───────────────────────────────────────────────────────────
+function renderSignals() {
+  const filtered = allOverlaps.filter(s => {
+    if (activeFilter === 'yes')  return s.outcome.toLowerCase() === 'yes';
+    if (activeFilter === 'no')   return s.outcome.toLowerCase() === 'no';
+    if (activeFilter === 'hot')  return s.holderCount >= 5;
+    return true;
+  });
+
+  document.getElementById('resultCount').textContent =
+    filtered.length + ' result' + (filtered.length !== 1 ? 's' : '');
+
+  const list = document.getElementById('signalList');
+
+  if (filtered.length === 0) {
+    list.innerHTML = `
+      <div class="state-box">
+        <div class="icon">◌</div>
+        <p>No signals matching this filter.<br>Data refreshes every 30 seconds.</p>
+      </div>`;
+    return;
+  }
+
+  list.innerHTML = filtered.map((s, i) => signalCard(s, i)).join('');
+
+  // Animate strength bars
+  setTimeout(() => {
+    document.querySelectorAll('.signal-bar-fill').forEach(el => {
+      el.style.width = el.dataset.width;
+    });
+  }, 50);
+}
+
+function signalCard(s, i) {
+  const strength = Math.min(s.holderCount / 10, 1);
+  const isYes = s.outcome.toLowerCase() === 'yes';
+  const pnlPos = s.avgPnl >= 0;
+
+  const badgeClass = s.holderCount >= 7 ? 'hot' : s.holderCount >= 5 ? 'warm' : 'cool';
+  const barColor = s.holderCount >= 7 ? 'var(--green)' : s.holderCount >= 5 ? 'var(--amber)' : '#555';
+
+  const holders = s.holders.map((h, j) => `
+    <div class="holder-row">
+      <span class="holder-rank">#${j+1}</span>
+      <span class="holder-wallet">${h.wallet.slice(0,6)}…${h.wallet.slice(-4)}</span>
+      <span class="holder-val">$${fmt(h.currentValue)}</span>
+      <span class="holder-price">@ ${fmtCents(h.avgPrice)}</span>
+      <span class="holder-pnl ${h.percentPnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${fmtPct(h.percentPnl)}</span>
+    </div>
+  `).join('');
+
+  const polyUrl = `https://polymarket.com/event/${s.slug || ''}`;
+
+  return `
+    <div class="signal" style="animation-delay:${i*40}ms" onclick="toggleCard(this)">
+      <div class="signal-head">
+        <div class="badge ${badgeClass}">${s.holderCount} traders</div>
+        <div class="signal-info">
+          <div class="signal-title" title="${escHtml(s.title)}">${escHtml(s.title)}</div>
+          <div class="signal-meta">
+            <span class="outcome-tag ${isYes ? 'yes' : 'no'}">${s.outcome}</span>
+            <span class="meta-item">Price <span>${fmtCents(s.curPrice)}</span></span>
+            <span class="meta-item">Value <span>$${fmt(s.totalValue)}</span></span>
+            <span class="meta-item">Avg PnL <span class="${pnlPos ? 'pnl-pos' : 'pnl-neg'}">${fmtPct(s.avgPnl)}</span></span>
+          </div>
+        </div>
+        <div class="chevron">⌄</div>
+      </div>
+      <div class="signal-bar">
+        <div class="signal-bar-fill" style="width:0%;background:${barColor}" data-width="${Math.round(strength*100)}%"></div>
+      </div>
+      <div class="holders-panel">
+        <div class="holders-title">Position holders</div>
+        ${holders}
+        <a class="poly-link" href="${polyUrl}" target="_blank" rel="noopener" onclick="event.stopPropagation()">
+          View on Polymarket ↗
+        </a>
+      </div>
+    </div>
+  `;
+}
+
+function toggleCard(el) {
+  const panel = el.querySelector('.holders-panel');
+  const chevron = el.querySelector('.chevron');
+  const open = panel.classList.toggle('open');
+  chevron.classList.toggle('open', open);
+}
+
+// ─── Status helpers ───────────────────────────────────────────────────────────
+function setStatus(type, text) {
+  const dot = document.getElementById('statusDot');
+  const label = document.getElementById('statusText');
+  dot.className = 'dot' + (type === 'live' ? ' live' : '');
+  label.textContent = text;
+}
+
+function setOffline(reason) {
+  setStatus('offline', reason);
+  document.getElementById('setupBanner').style.display = 'block';
+}
+
+// ─── Formatters ───────────────────────────────────────────────────────────────
+const fmt = n => (n ?? 0).toLocaleString('en-US', { maximumFractionDigits: 0 });
+const fmtCents = n => (n * 100).toFixed(1) + '¢';
+const fmtPct = n => (n >= 0 ? '+' : '') + (n ?? 0).toFixed(1) + '%';
+const escHtml = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+function elapsed(iso) {
+  const diff = Math.floor((Date.now() - new Date(iso)) / 1000);
+  if (diff < 60) return diff + 's ago';
+  if (diff < 3600) return Math.floor(diff/60) + 'm ago';
+  return Math.floor(diff/3600) + 'h ago';
+}
+</script>
+</body>
+</html>
