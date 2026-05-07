@@ -104,9 +104,12 @@ def get_api(url, params=None, retries=3):
 
 # ─── Leaderboard ──────────────────────────────────────────────────────────────
 
-
 def fetch_leaderboard():
-    # Get top active markets by volume
+    """
+    Get active wallets by pulling recent large trades across top markets.
+    Uses /trades endpoint which is confirmed working in the official docs.
+    """
+    # Get top active markets
     markets = get_api(f"{GAMMA_API}/markets", {
         "closed": "false",
         "limit": 10,
@@ -117,38 +120,29 @@ def fetch_leaderboard():
         return []
 
     wallets = set()
-    for market in markets[:5]:
-        # holders endpoint needs the token asset ID, not conditionId
-        # each market has clobTokenIds — a list of token IDs for Yes/No
-        token_ids = market.get("clobTokenIds", "[]")
-        if isinstance(token_ids, str):
-            import json as _json
-            try:
-                token_ids = _json.loads(token_ids)
-            except Exception:
-                continue
-
-        # Just use the first token (Yes side)
-        if not token_ids:
+    for market in markets[:8]:
+        condition_id = market.get("conditionId", "")
+        if not condition_id:
             continue
 
-        token_id = token_ids[0]
-
-        holders = get_api(f"{DATA_API}/holders", {
-            "market": token_id,
-            "limit": 20,
+        # /trades is confirmed in the official docs
+        trades = get_api(f"{DATA_API}/trades", {
+            "market": condition_id,
+            "limit": 50,
+            "taker_only": "true",
         })
-        if not isinstance(holders, list):
+        if not isinstance(trades, list):
             continue
 
-        for h in holders:
-            w = h.get("proxyWallet") or h.get("address", "")
-            if w:
+        for t in trades:
+            w = t.get("maker") or t.get("taker") or \
+                t.get("proxyWallet") or t.get("transactorAddress", "")
+            if w and w.startswith("0x"):
                 wallets.add(w)
 
         time.sleep(CFG["request_delay_s"])
 
-    log.info(f"Wallets gathered from top market holders: {len(wallets)}")
+    log.info(f"Wallets gathered from recent trades: {len(wallets)}")
     return list(wallets)
 
 
