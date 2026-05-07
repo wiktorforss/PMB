@@ -1,7 +1,11 @@
 """
-Polymarket Smart Money Tracker — Railway Edition
-Runs a polling loop in a background thread + serves results via Flask API.
-Railway keeps this process alive 24/7.
+PMB — Polymarket Brain
+Railway Edition: Flask API + background polling loop.
+- Fetches active wallets from top market trades
+- Detects overlapping positions across wallets
+- Sends Telegram alerts ONCE per signal per day
+- Persists triggered signals to disk — restarts won't cause repeats
+- Resets triggered list daily so genuinely new signals re-alert
 """
 
 import os
@@ -23,51 +27,95 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ─── Config (from env vars — set these in Railway dashboard) ──────────────────
+# ─── Config ───────────────────────────────────────────────────────────────────
 CFG = {
-    "leaderboard_window":          os.getenv("LEADERBOARD_WINDOW", "7d"),
-    "leaderboard_limit":       int(os.getenv("LEADERBOARD_LIMIT", "75")),
-    "leaderboard_refresh_s":   int(os.getenv("LEADERBOARD_REFRESH_S", "900")),
-    "poll_interval_s":         int(os.getenv("POLL_INTERVAL_S", "300")),
-    "request_delay_s":       float(os.getenv("REQUEST_DELAY_S", "0.5")),
-    "min_overlap":             int(os.getenv("MIN_OVERLAP", "2")),
-    "min_position_usd":      float(os.getenv("MIN_POSITION_USD", "100")),
-    "max_entry_price":       float(os.getenv("MAX_ENTRY_PRICE", "0.85")),
-    "notify_threshold":        int(os.getenv("NOTIFY_THRESHOLD", "2")),
-    "telegram_token":              os.getenv("TELEGRAM_TOKEN", ""),
-    "telegram_chat_id":            os.getenv("TELEGRAM_CHAT_ID", ""),
-    "autobuy_enabled":             os.getenv("AUTOBUY_ENABLED", "false").lower() == "true",
-    "autobuy_min_overlap":     int(os.getenv("AUTOBUY_MIN_OVERLAP", "5")),
-    "autobuy_max_price":     float(os.getenv("AUTOBUY_MAX_PRICE", "0.70")),
-    "autobuy_size_usd":      float(os.getenv("AUTOBUY_SIZE_USD", "10")),
-    "autobuy_daily_limit":   float(os.getenv("AUTOBUY_DAILY_LIMIT", "50")),
-    "private_key":                 os.getenv("POLYMARKET_PRIVATE_KEY", ""),
-    "port":                    int(os.getenv("PORT", "8080")),
+    "leaderboard_window":        os.getenv("LEADERBOARD_WINDOW", "7d"),
+    "leaderboard_limit":     int(os.getenv("LEADERBOARD_LIMIT", "75")),
+    "leaderboard_refresh_s": int(os.getenv("LEADERBOARD_REFRESH_S", "900")),
+    "poll_interval_s":       int(os.getenv("POLL_INTERVAL_S", "300")),
+    "request_delay_s":     float(os.getenv("REQUEST_DELAY_S", "0.5")),
+    "min_overlap":           int(os.getenv("MIN_OVERLAP", "2")),
+    "min_position_usd":    float(os.getenv("MIN_POSITION_USD", "100")),
+    "max_entry_price":     float(os.getenv("MAX_ENTRY_PRICE", "0.85")),
+    "notify_threshold":      int(os.getenv("NOTIFY_THRESHOLD", "2")),
+    "telegram_token":            os.getenv("TELEGRAM_TOKEN", ""),
+    "telegram_chat_id":          os.getenv("TELEGRAM_CHAT_ID", ""),
+    "autobuy_enabled":           os.getenv("AUTOBUY_ENABLED", "false").lower() == "true",
+    "autobuy_min_overlap":   int(os.getenv("AUTOBUY_MIN_OVERLAP", "5")),
+    "autobuy_max_price":   float(os.getenv("AUTOBUY_MAX_PRICE", "0.70")),
+    "autobuy_size_usd":    float(os.getenv("AUTOBUY_SIZE_USD", "10")),
+    "autobuy_daily_limit": float(os.getenv("AUTOBUY_DAILY_LIMIT", "50")),
+    "private_key":               os.getenv("POLYMARKET_PRIVATE_KEY", ""),
+    "port":                  int(os.getenv("PORT", "8080")),
 }
 
-DATA_API = "https://data-api.polymarket.com"
+DATA_API  = "https://data-api.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
-# ─── Shared state (thread-safe via lock) ─────────────────────────────────────
+
+TRIGGERED_FILE = Path("triggered.json")
+
+
+# ─── Persistent triggered store ───────────────────────────────────────────────
+
+def load_triggered() -> dict:
+    """
+    Load triggered signals from disk.
+    Format: { "date": "YYYY-MM-DD", "keys": ["conditionId|outcome", ...] }
+    If the saved date is not today, returns a fresh empty store.
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if TRIGGERED_FILE.exists():
+        try:
+            data = json.loads(TRIGGERED_FILE.read_text())
+            if data.get("date") == today:
+                log.info(f"Loaded {len(data.get('keys', []))} triggered signals from disk")
+                return data
+        except Exception as e:
+            log.warning(f"Could not read triggered.json: {e}")
+    # New day or missing file — start fresh
+    return {"date": today, "keys": []}
+
+
+def save_triggered(store: dict):
+    try:
+        TRIGGERED_FILE.write_text(json.dumps(store))
+    except Exception as e:
+        log.warning(f"Could not save triggered.json: {e}")
+
+
+def maybe_reset_triggered(store: dict) -> dict:
+    """Reset the triggered store if the day has rolled over."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if store.get("date") != today:
+        log.info("New day — resetting triggered signals list")
+        store = {"date": today, "keys": []}
+        save_triggered(store)
+    return store
+
+
+# ─── Shared state ─────────────────────────────────────────────────────────────
 _lock = threading.Lock()
+
+_triggered_store = load_triggered()  # { date, keys: [] }
+
 _state = {
-    "results": None,          # Latest scan results
-    "leaderboard": [],        # Wallet addresses
-    "triggered": set(),       # Already auto-bought market keys
-    "daily_spend": 0.0,
-    "daily_spend_date": "",
-    "last_lb_fetch": 0,
-    "scan_count": 0,
-    "started_at": datetime.now(timezone.utc).isoformat(),
+    "results":           None,
+    "leaderboard":       [],
+    "daily_spend":       0.0,
+    "daily_spend_date":  "",
+    "last_lb_fetch":     0,
+    "scan_count":        0,
+    "started_at":        datetime.now(timezone.utc).isoformat(),
 }
 
 # ─── Flask app ────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-CORS(app)  # Allow GitHub Pages to fetch from Railway
+CORS(app, origins="*", methods=["GET"], allow_headers=["Content-Type"])
 
 
 @app.route("/")
 def index():
-    return jsonify({"status": "ok", "service": "Polymarket Smart Money Tracker"})
+    return jsonify({"status": "ok", "service": "PMB — Polymarket Brain"})
 
 
 @app.route("/results")
@@ -82,10 +130,11 @@ def results():
 def health():
     with _lock:
         return jsonify({
-            "status": "ok",
-            "scan_count": _state["scan_count"],
+            "status":          "ok",
+            "scan_count":      _state["scan_count"],
             "wallets_tracked": len(_state["leaderboard"]),
-            "started_at": _state["started_at"],
+            "started_at":      _state["started_at"],
+            "triggered_today": len(_triggered_store.get("keys", [])),
         })
 
 
@@ -102,19 +151,17 @@ def get_api(url, params=None, retries=3):
     return None
 
 
-# ─── Leaderboard ──────────────────────────────────────────────────────────────
-
+# ─── Wallet collection ────────────────────────────────────────────────────────
 def fetch_leaderboard():
     """
-    Get active wallets by pulling recent large trades across top markets.
-    Uses /trades endpoint which is confirmed working in the official docs.
+    Collect active wallet addresses by pulling recent trades
+    from the top volume markets via the confirmed /trades endpoint.
     """
-    # Get top active markets
     markets = get_api(f"{GAMMA_API}/markets", {
-        "closed": "false",
-        "limit": 15,
-        "order": "volumeNum",
-        "ascending": "false",
+        "closed":     "false",
+        "limit":      15,
+        "order":      "volumeNum",
+        "ascending":  "false",
     })
     if not markets:
         return []
@@ -125,18 +172,20 @@ def fetch_leaderboard():
         if not condition_id:
             continue
 
-        # /trades is confirmed in the official docs
         trades = get_api(f"{DATA_API}/trades", {
-            "market": condition_id,
-            "limit": 75,
+            "market":     condition_id,
+            "limit":      75,
             "taker_only": "true",
         })
         if not isinstance(trades, list):
             continue
 
+        if trades:
+            log.debug(f"Trade keys: {list(trades[0].keys())}")
+
         for t in trades:
-            w = t.get("maker") or t.get("taker") or \
-                t.get("proxyWallet") or t.get("transactorAddress", "")
+            w = (t.get("maker") or t.get("taker") or
+                 t.get("proxyWallet") or t.get("transactorAddress", ""))
             if w and w.startswith("0x"):
                 wallets.add(w)
 
@@ -148,7 +197,10 @@ def fetch_leaderboard():
 
 # ─── Positions ────────────────────────────────────────────────────────────────
 def fetch_positions(wallet):
-    data = get_api(f"{DATA_API}/positions", {"user": wallet, "sizeThreshold": 15})
+    data = get_api(f"{DATA_API}/positions", {
+        "user":          wallet,
+        "sizeThreshold": 15,
+    })
     return data if isinstance(data, list) else []
 
 
@@ -159,9 +211,9 @@ def detect_overlaps(wallets):
     for i, wallet in enumerate(wallets):
         positions = fetch_positions(wallet)
         for pos in positions:
-            cid = pos.get("conditionId", "")
-            outcome = pos.get("outcome", "")
-            cur_price = pos.get("curPrice", 1.0)
+            cid           = pos.get("conditionId", "")
+            outcome       = pos.get("outcome", "")
+            cur_price     = pos.get("curPrice", 1.0)
             current_value = pos.get("currentValue", 0)
 
             if current_value < CFG["min_position_usd"]:
@@ -171,16 +223,16 @@ def detect_overlaps(wallets):
 
             key = f"{cid}|{outcome}"
             market_holders[key].append({
-                "wallet": wallet,
-                "conditionId": cid,
-                "outcome": outcome,
-                "curPrice": cur_price,
+                "wallet":       wallet,
+                "conditionId":  cid,
+                "outcome":      outcome,
+                "curPrice":     cur_price,
                 "currentValue": current_value,
-                "title": pos.get("title", "Unknown"),
-                "slug": pos.get("slug", ""),
-                "size": pos.get("size", 0),
-                "avgPrice": pos.get("avgPrice", 0),
-                "percentPnl": pos.get("percentPnl", 0),
+                "title":        pos.get("title", "Unknown"),
+                "slug":         pos.get("slug", ""),
+                "size":         pos.get("size", 0),
+                "avgPrice":     pos.get("avgPrice", 0),
+                "percentPnl":   pos.get("percentPnl", 0),
             })
 
         if i < len(wallets) - 1:
@@ -192,14 +244,14 @@ def detect_overlaps(wallets):
             s = holders[0]
             overlaps.append({
                 "conditionId": s["conditionId"],
-                "outcome": s["outcome"],
-                "title": s["title"],
-                "slug": s["slug"],
-                "curPrice": s["curPrice"],
+                "outcome":     s["outcome"],
+                "title":       s["title"],
+                "slug":        s["slug"],
+                "curPrice":    s["curPrice"],
                 "holderCount": len(holders),
-                "holders": holders,
-                "totalValue": sum(h["currentValue"] for h in holders),
-                "avgPnl": sum(h["percentPnl"] for h in holders) / len(holders),
+                "holders":     holders,
+                "totalValue":  sum(h["currentValue"] for h in holders),
+                "avgPnl":      sum(h["percentPnl"] for h in holders) / len(holders),
             })
 
     overlaps.sort(key=lambda x: x["holderCount"], reverse=True)
@@ -208,34 +260,37 @@ def detect_overlaps(wallets):
 
 # ─── Telegram ─────────────────────────────────────────────────────────────────
 def notify(signal):
-    token = CFG["telegram_token"]
+    token   = CFG["telegram_token"]
     chat_id = CFG["telegram_chat_id"]
     if not token or not chat_id:
         return
 
-    emoji = "🟢" if signal["outcome"].lower() == "yes" else "🔴"
+    emoji     = "🟢" if signal["outcome"].lower() == "yes" else "🔴"
     pnl_emoji = "📈" if signal["avgPnl"] > 0 else "📉"
-    url = f"https://polymarket.com/event/{signal.get('slug', '')}"
+    url       = f"https://polymarket.com/event/{signal.get('slug', '')}"
 
     msg = (
-        f"🎯 *Smart Money Signal*\n\n"
+        f"🎯 *PMB Signal*\n\n"
         f"{emoji} *{signal['title']}*\n"
         f"Outcome: *{signal['outcome']}* @ `{signal['curPrice']:.3f}`\n\n"
-        f"👥 *{signal['holderCount']} leaderboard traders*\n"
+        f"👥 *{signal['holderCount']} traders in this position*\n"
         f"💰 Combined: `${signal['totalValue']:,.0f}`\n"
         f"{pnl_emoji} Avg PnL: `{signal['avgPnl']:.1f}%`\n\n"
         f"🔗 [View on Polymarket]({url})"
     )
 
     try:
-        requests.post(
+        resp = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"},
             timeout=10,
         )
-        log.info(f"Telegram sent for: {signal['title']}")
+        if resp.ok:
+            log.info(f"Telegram sent: {signal['title']}")
+        else:
+            log.error(f"Telegram error {resp.status_code}: {resp.text}")
     except Exception as e:
-        log.error(f"Telegram error: {e}")
+        log.error(f"Telegram exception: {e}")
 
 
 # ─── Auto-buy ─────────────────────────────────────────────────────────────────
@@ -246,7 +301,7 @@ def attempt_autobuy(signal):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     with _lock:
         if _state["daily_spend_date"] != today:
-            _state["daily_spend"] = 0.0
+            _state["daily_spend"]      = 0.0
             _state["daily_spend_date"] = today
         remaining = CFG["autobuy_daily_limit"] - _state["daily_spend"]
 
@@ -254,25 +309,26 @@ def attempt_autobuy(signal):
         log.warning("Daily auto-buy limit reached.")
         return False
 
-    size_usd = min(CFG["autobuy_size_usd"], remaining)
     private_key = CFG["private_key"]
     if not private_key:
         log.error("No POLYMARKET_PRIVATE_KEY set.")
         return False
+
+    size_usd = min(CFG["autobuy_size_usd"], remaining)
 
     try:
         from py_clob_client_v2 import ClobClient
         from py_clob_client_v2.clob_types import OrderArgs, OrderType
         from py_clob_client_v2.constants import POLYGON
 
-        temp = ClobClient("https://clob.polymarket.com", key=private_key, chain_id=POLYGON)
-        creds = temp.create_or_derive_api_creds()
+        temp   = ClobClient("https://clob.polymarket.com", key=private_key, chain_id=POLYGON)
+        creds  = temp.create_or_derive_api_creds()
         client = ClobClient("https://clob.polymarket.com", key=private_key, chain_id=POLYGON, creds=creds)
 
-        market_info = client.get_market(condition_id=signal["conditionId"])
-        tokens = market_info.get("tokens", [])
+        market_info   = client.get_market(condition_id=signal["conditionId"])
+        tokens        = market_info.get("tokens", [])
         outcome_index = 0 if signal["outcome"].lower() == "yes" else 1
-        token_id = tokens[outcome_index]["token_id"]
+        token_id      = tokens[outcome_index]["token_id"]
 
         order = client.create_order(OrderArgs(
             token_id=token_id,
@@ -293,14 +349,19 @@ def attempt_autobuy(signal):
         return False
 
 
-# ─── Polling loop (runs in background thread) ─────────────────────────────────
+# ─── Polling loop ─────────────────────────────────────────────────────────────
 def polling_loop():
+    global _triggered_store
     last_positions_poll = 0
 
     while True:
         now = time.time()
 
-        # Refresh leaderboard
+        # ── Daily reset check ──────────────────────────────────────────────────
+        with _lock:
+            _triggered_store = maybe_reset_triggered(_triggered_store)
+
+        # ── Refresh wallet list ────────────────────────────────────────────────
         with _lock:
             last_lb = _state["last_lb_fetch"]
             wallets = _state["leaderboard"]
@@ -309,55 +370,62 @@ def polling_loop():
             new_wallets = fetch_leaderboard()
             if new_wallets:
                 with _lock:
-                    _state["leaderboard"] = new_wallets
+                    _state["leaderboard"]  = new_wallets
                     _state["last_lb_fetch"] = now
                 wallets = new_wallets
 
         if not wallets:
-            log.info("Waiting for leaderboard...")
+            log.info("Waiting for wallets...")
             time.sleep(30)
             continue
 
-        # Poll positions
+        # ── Scan positions ─────────────────────────────────────────────────────
         if now - last_positions_poll >= CFG["poll_interval_s"]:
             log.info(f"Scanning {len(wallets)} wallets...")
             overlaps = detect_overlaps(wallets)
 
-            result = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "walletCount": len(wallets),
-                "scanCount": _state["scan_count"] + 1,
-                "overlaps": overlaps,
-                "config": {
-                    "minOverlap": CFG["min_overlap"],
-                    "pollIntervalS": CFG["poll_interval_s"],
-                    "leaderboardWindow": CFG["leaderboard_window"],
-                },
-            }
-
             with _lock:
-                _state["results"] = result
                 _state["scan_count"] += 1
+                _state["results"] = {
+                    "timestamp":   datetime.now(timezone.utc).isoformat(),
+                    "walletCount": len(wallets),
+                    "scanCount":   _state["scan_count"],
+                    "overlaps":    overlaps,
+                    "config": {
+                        "minOverlap":        CFG["min_overlap"],
+                        "pollIntervalS":     CFG["poll_interval_s"],
+                        "leaderboardWindow": CFG["leaderboard_window"],
+                    },
+                }
 
-            log.info(f"Scan #{_state['scan_count']}: {len(overlaps)} signals")
+            log.info(f"Scan #{_state['scan_count']}: {len(overlaps)} signals found")
 
-            # Notifications + auto-buy
+            # ── Notify + auto-buy ──────────────────────────────────────────────
             for signal in overlaps:
                 key = f"{signal['conditionId']}|{signal['outcome']}"
-                with _lock:
-                    already = key in _state["triggered"]
 
-                if not already and signal["holderCount"] >= CFG["notify_threshold"]:
+                with _lock:
+                    already_triggered = key in _triggered_store["keys"]
+
+                if already_triggered:
+                    continue  # Already notified today — skip entirely
+
+                # New signal — notify
+                if signal["holderCount"] >= CFG["notify_threshold"]:
                     notify(signal)
 
-                if (not already
-                        and CFG["autobuy_enabled"]
+                    # Mark as triggered and persist to disk immediately
+                    with _lock:
+                        _triggered_store["keys"].append(key)
+                        save_triggered(_triggered_store)
+
+                    log.info(f"Marked as triggered: {signal['title']} ({signal['outcome']})")
+
+                # Auto-buy if enabled
+                if (CFG["autobuy_enabled"]
                         and signal["holderCount"] >= CFG["autobuy_min_overlap"]
                         and signal["curPrice"] <= CFG["autobuy_max_price"]):
-                    success = attempt_autobuy(signal)
-                    if success:
-                        with _lock:
-                            _state["triggered"].add(key)
+                    attempt_autobuy(signal)
 
             last_positions_poll = now
 
@@ -366,7 +434,7 @@ def polling_loop():
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("Starting Polymarket Smart Money Tracker on Railway...")
+    log.info("Starting PMB — Polymarket Brain...")
     try:
         t = threading.Thread(target=polling_loop, daemon=True)
         t.start()
