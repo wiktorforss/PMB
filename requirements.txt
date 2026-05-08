@@ -3,4 +3,4 @@ flask-cors>=4.0.0
 requests>=2.31.0
 gunicorn>=21.2.0
 # Uncomment for auto-buy:
-# py-clob-client-v2
+py-clob-client-v2
