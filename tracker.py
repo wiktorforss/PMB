@@ -75,13 +75,30 @@ DEFAULT_SETTINGS = {
     "min_position_usd":float(os.getenv("MIN_POSITION_USD", "100")),
     "max_entry_price": float(os.getenv("MAX_ENTRY_PRICE", "0.85")),
     "notify_threshold":int(os.getenv("NOTIFY_THRESHOLD", "2")),
-    "autobuy_enabled":     os.getenv("AUTOBUY_ENABLED", "false").lower() == "true",
-    "autobuy_min_overlap":int(os.getenv("AUTOBUY_MIN_OVERLAP", "2")),
+    "autobuy_enabled":         os.getenv("AUTOBUY_ENABLED", "false").lower() == "true",
+    "autobuy_min_overlap":  int(os.getenv("AUTOBUY_MIN_OVERLAP", "2")),
     "autobuy_max_price":  float(os.getenv("AUTOBUY_MAX_PRICE", "0.70")),
     "autobuy_size_usd":   float(os.getenv("AUTOBUY_SIZE_USD", "10")),
     "autobuy_daily_limit":float(os.getenv("AUTOBUY_DAILY_LIMIT", "100")),
+    # Crypto market filter
+    # If true, auto-buy only triggers on BTC/ETH 5min and 15min markets
+    "autobuy_crypto_only":     os.getenv("AUTOBUY_CRYPTO_ONLY", "false").lower() == "true",
     "paused": False,
 }
+
+# Keywords that identify BTC/ETH short-term candle markets
+CRYPTO_CANDLE_KEYWORDS = [
+    "btc", "bitcoin", "eth", "ethereum",
+    "5-min", "5 min", "15-min", "15 min",
+    "5min", "15min",
+]
+
+def is_crypto_candle_market(title: str) -> bool:
+    """Returns True if the market title matches a BTC/ETH 5min or 15min candle market."""
+    t = title.lower()
+    has_asset    = any(k in t for k in ["btc", "bitcoin", "eth", "ethereum"])
+    has_timeframe = any(k in t for k in ["5-min", "5 min", "5min", "15-min", "15 min", "15min"])
+    return has_asset and has_timeframe
 
 
 # ─── Persistence helpers ──────────────────────────────────────────────────────
@@ -253,6 +270,7 @@ def handle_command(command: str, args: list) -> str:
             "<code>/setdailylimit 100</code> — max daily spend\n"
             "<code>/setmaxprice 70</code> — max entry price in cents\n"
             "<code>/setminoverlap 3</code> — min traders to trigger buy\n"
+            "<code>/setcryptoonly on|off</code> — only auto-buy BTC/ETH 5min &amp; 15min\n"
             "<code>/setcategory CRYPTO</code> — leaderboard category\n"
             "  Options: OVERALL CRYPTO POLITICS SPORTS\n"
             "  ECONOMICS TECH FINANCE CULTURE\n"
@@ -281,6 +299,7 @@ def handle_command(command: str, args: list) -> str:
             f"<b>Wallets tracked:</b> {wallets}\n"
             f"<b>Signals today:</b> {alerted}\n\n"
             f"<b>Auto-buy:</b> {ab}\n"
+            f"<b>Crypto-only:</b> {'✅ ON' if s.get('autobuy_crypto_only') else '❌ OFF'}\n"
             f"<b>Trade size:</b> <code>${s['autobuy_size_usd']:.0f}</code>\n"
             f"<b>Daily limit:</b> <code>${s['autobuy_daily_limit']:.0f}</code>\n"
             f"<b>Spent today:</b> <code>${spent:.2f}</code> ({bought} trades)\n"
@@ -366,6 +385,27 @@ def handle_command(command: str, args: list) -> str:
             return f"✅ Min overlap set to <code>{val} traders</code>."
         except ValueError:
             return "❌ Invalid number. Usage: /setminoverlap 3"
+
+    elif command == "/setcryptoonly":
+        if not args:
+            cur = "ON" if s.get("autobuy_crypto_only") else "OFF"
+            return (
+                f"Crypto-only auto-buy is <b>{cur}</b>.\n"
+                f"When ON, only BTC/ETH 5min and 15min markets are auto-bought.\n"
+                f"Usage: /setcryptoonly on or /setcryptoonly off"
+            )
+        val = args[0].lower()
+        if val == "on":
+            with _lock:
+                _settings["autobuy_crypto_only"] = True
+                save_settings(_settings)
+            return "✅ Crypto-only mode <b>ON</b>. Auto-buy limited to BTC/ETH 5min and 15min markets."
+        elif val == "off":
+            with _lock:
+                _settings["autobuy_crypto_only"] = False
+                save_settings(_settings)
+            return "✅ Crypto-only mode <b>OFF</b>. Auto-buy applies to all signals."
+        return "Usage: /setcryptoonly on or /setcryptoonly off"
 
     elif command == "/setcategory":
         if not args:
@@ -608,6 +648,12 @@ def attempt_autobuy(signal: dict) -> bool:
     if not s["autobuy_enabled"]:
         return False
 
+    # Crypto candle filter
+    if s.get("autobuy_crypto_only", False):
+        if not is_crypto_candle_market(signal["title"]):
+            log.info(f"Skipping (not a crypto candle market): {signal['title']}")
+            return False
+
     remaining = s["autobuy_daily_limit"] - spent
     if remaining <= 0:
         log.warning("Daily auto-buy limit reached")
@@ -618,30 +664,37 @@ def attempt_autobuy(signal: dict) -> bool:
         log.error("No POLYMARKET_PRIVATE_KEY set")
         return False
 
+    # POLYMARKET_FUNDER = your Polymarket profile address (needed for proxy/email wallets)
+    funder   = os.getenv("POLYMARKET_FUNDER", "")
+    sig_type = int(os.getenv("POLYMARKET_SIG_TYPE", "0"))  # 0=MetaMask, 1=Magic/email
+
     size_usd = min(s["autobuy_size_usd"], remaining)
     title    = _escape_html(signal["title"])
 
     try:
         from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
+        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client.order_builder.constants import BUY
         from py_clob_client.constants import POLYGON
 
-        # Correct auth flow for py-clob-client (no v2)
-        client = ClobClient(
-            host     = "https://clob.polymarket.com",
-            key      = PRIVATE_KEY,
-            chain_id = POLYGON,
-        )
+        # Build client — include funder + sig_type for proxy/email wallets
+        kwargs = dict(host="https://clob.polymarket.com", key=PRIVATE_KEY, chain_id=POLYGON)
+        if funder:
+            kwargs["signature_type"] = sig_type
+            kwargs["funder"]         = funder
 
-        # Derive L2 API credentials from L1 wallet key
-        api_creds = client.derive_api_key()
-        client.set_api_creds(ApiCreds(
-            api_key        = api_creds["apiKey"],
-            api_secret     = api_creds["secret"],
-            api_passphrase = api_creds["passphrase"],
+        client = ClobClient(**kwargs)
+
+        # L2 auth — derive_api_key returns ApiCreds object, access via attributes not dict
+        from py_clob_client.clob_types import ApiCreds as _ApiCreds
+        raw = client.derive_api_key()
+        client.set_api_creds(_ApiCreds(
+            api_key        = raw.api_key,
+            api_secret     = raw.api_secret,
+            api_passphrase = raw.api_passphrase,
         ))
 
-        # Resolve token ID for the outcome
+        # Resolve token ID for the correct outcome
         market_info   = client.get_market(condition_id=signal["conditionId"])
         tokens        = market_info.get("tokens", [])
         outcome_index = 0 if signal["outcome"].lower() == "yes" else 1
@@ -652,12 +705,12 @@ def attempt_autobuy(signal: dict) -> bool:
 
         token_id = tokens[outcome_index]["token_id"]
 
-        # Place order
+        # Limit order with slight slippage buffer, capped at 0.99
         order = client.create_order(OrderArgs(
             token_id = token_id,
-            price    = round(signal["curPrice"] + 0.01, 3),
+            price    = round(min(signal["curPrice"] + 0.01, 0.99), 3),
             size     = round(size_usd / signal["curPrice"], 2),
-            side     = "BUY",
+            side     = BUY,
         ))
         resp = client.post_order(order, OrderType.GTC)
 
@@ -665,7 +718,7 @@ def attempt_autobuy(signal: dict) -> bool:
             order_id = resp.get("orderID", "unknown")
             with _lock:
                 _bought_store["total_spent"] += size_usd
-                save_bought(_bought_store)
+                _save(BOUGHT_FILE, _bought_store)
             log.info(f"Auto-buy success: {order_id} ${size_usd:.0f}")
             send_html(
                 f"✅ <b>Auto-buy executed</b>\n"
@@ -680,16 +733,12 @@ def attempt_autobuy(signal: dict) -> bool:
             return False
 
     except ImportError:
-        log.error("py-clob-client not installed. Add to requirements.txt")
+        log.error("py-clob-client not installed")
         return False
     except Exception as e:
         log.error(f"Auto-buy error: {e}")
         send_html(f"❌ Auto-buy error: <code>{_escape_html(str(e))}</code>")
         return False
-
-
-def _save_bought_store():
-    _save(BOUGHT_FILE, _bought_store)
 
 
 # ─── Polling loop ─────────────────────────────────────────────────────────────
