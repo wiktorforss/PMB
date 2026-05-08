@@ -52,8 +52,8 @@ DEFAULT_SETTINGS = {
     "lb_refresh_s":  int(os.getenv("LB_REFRESH_S", "900")),
 
     # Polling
-    "poll_interval_s":   int(os.getenv("POLL_INTERVAL_S", "300")),
-    "request_delay_s": float(os.getenv("REQUEST_DELAY_S", "0.5")),
+    "poll_interval_s":   int(os.getenv("POLL_INTERVAL_S", "60")),
+    "request_delay_s": float(os.getenv("REQUEST_DELAY_S", "0.1")),
 
     # Signal detection
     "min_overlap":       int(os.getenv("MIN_OVERLAP", "2")),
@@ -65,10 +65,10 @@ DEFAULT_SETTINGS = {
 
     # Auto-buy
     "autobuy_enabled":      os.getenv("AUTOBUY_ENABLED", "false").lower() == "true",
-    "autobuy_min_overlap":  int(os.getenv("AUTOBUY_MIN_OVERLAP", "3")),
+    "autobuy_min_overlap":  int(os.getenv("AUTOBUY_MIN_OVERLAP", "2")),
     "autobuy_max_price":  float(os.getenv("AUTOBUY_MAX_PRICE", "0.70")),
     "autobuy_size_usd":   float(os.getenv("AUTOBUY_SIZE_USD", "10")),
-    "autobuy_daily_limit":float(os.getenv("AUTOBUY_DAILY_LIMIT", "50")),
+    "autobuy_daily_limit":float(os.getenv("AUTOBUY_DAILY_LIMIT", "100")),
 
     # Misc
     "paused": False,
