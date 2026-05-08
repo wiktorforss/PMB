@@ -70,7 +70,7 @@ DEFAULT_SETTINGS = {
     "lb_category":         os.getenv("LB_CATEGORY", "OVERALL"),
     "lb_refresh_s":    int(os.getenv("LB_REFRESH_S", "900")),
     "poll_interval_s": int(os.getenv("POLL_INTERVAL_S", "60")),
-    "request_delay_s":float(os.getenv("REQUEST_DELAY_S", "0.1")),
+    "request_delay_s":float(os.getenv("REQUEST_DELAY_S", "0.2")),
     "min_overlap":     int(os.getenv("MIN_OVERLAP", "2")),
     "min_position_usd":float(os.getenv("MIN_POSITION_USD", "100")),
     "max_entry_price": float(os.getenv("MAX_ENTRY_PRICE", "0.85")),
