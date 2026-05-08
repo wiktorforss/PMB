@@ -87,19 +87,62 @@ DEFAULT_SETTINGS = {
 }
 
 # Keywords that identify BTC/ETH short-term candle markets
-CRYPTO_CANDLE_KEYWORDS = [
-    "btc", "bitcoin", "eth", "ethereum",
-    "5-min", "5 min", "15-min", "15 min",
-    "5min", "15min",
-]
+# Patterns that identify BTC/ETH short-term candle markets
+CRYPTO_ASSETS = ["btc", "bitcoin", "eth", "ethereum"]
+
+# Explicit timeframe keywords
+CANDLE_TIMEFRAMES = ["5-min", "5 min", "5min", "15-min", "15 min", "15min"]
+
+# Time range pattern: "1:30PM-1:35PM" or "1:00PM-1:15PM" — 5 or 15 min windows
+import re as _re
+_TIME_RANGE_RE = _re.compile(
+    r"(\d{1,2}:\d{2}[ap]m)-(\d{1,2}:\d{2}[ap]m)",
+    _re.IGNORECASE
+)
+
+def _time_range_minutes(t: str) -> int:
+    """Parse a time range string and return the duration in minutes, or 0 if unparseable."""
+    from datetime import datetime as _dt
+    try:
+        start_s, end_s = t.group(1), t.group(2)
+        fmt = "%I:%M%p"
+        start = _dt.strptime(start_s.upper(), fmt)
+        end   = _dt.strptime(end_s.upper(),   fmt)
+        diff  = int((end - start).total_seconds() / 60)
+        return diff
+    except Exception:
+        return 0
 
 def is_crypto_candle_market(title: str) -> bool:
-    """Returns True if the market title matches a BTC/ETH 5min or 15min candle market."""
+    """
+    Returns True if the market is a BTC/ETH short-term (5min or 15min) candle.
+    Matches both explicit keywords (5min, 15min) and time range formats
+    like 1:30PM-1:35PM (5 mins) or 1:00PM-1:15PM (15 mins).
+    Also matches "Up or Down" style markets which are always short-term candles.
+    """
     t = title.lower()
-    has_asset    = any(k in t for k in ["btc", "bitcoin", "eth", "ethereum"])
-    has_timeframe = any(k in t for k in ["5-min", "5 min", "5min", "15-min", "15 min", "15min"])
-    return has_asset and has_timeframe
 
+    # Must mention BTC or ETH
+    has_asset = any(k in t for k in CRYPTO_ASSETS)
+    if not has_asset:
+        return False
+
+    # Explicit timeframe keywords
+    if any(k in t for k in CANDLE_TIMEFRAMES):
+        return True
+
+    # Time range pattern — check if window is 5 or 15 minutes
+    match = _TIME_RANGE_RE.search(title)
+    if match:
+        mins = _time_range_minutes(match)
+        if mins in (5, 15):
+            return True
+
+    # "Up or Down" with a specific time/date is always a short-term candle market
+    if "up or down" in t and any(k in t for k in ["pm", "am", "pm et", "am et"]):
+        return True
+
+    return False
 
 # ─── Persistence helpers ──────────────────────────────────────────────────────
 
