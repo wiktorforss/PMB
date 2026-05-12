@@ -24,8 +24,9 @@ logging.basicConfig(
 log = logging.getLogger("PMB")
 
 # ─── Env / Config ───────────────────────────────────────────────────────────
-DATA_API      = "https://data-api.polymarket.com"
-CLOB_HOST     = "https://clob.polymarket.com"
+GAMMA_API     = "https://gamma-api.polymarket.com"   # market discovery, events, tags
+DATA_API      = "https://data-api.polymarket.com"    # trades, positions, leaderboard
+CLOB_HOST     = "https://clob.polymarket.com"        # order placement
 
 POLL_INTERVAL_S      = int(os.getenv("POLL_INTERVAL_S",      "60"))    # main loop cadence
 MARKET_REFRESH_S     = int(os.getenv("MARKET_REFRESH_S",     "120"))   # re-discover markets
