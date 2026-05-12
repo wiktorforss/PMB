@@ -170,168 +170,152 @@ class PolymarketClient:
         return None
 
     # ──────────────────────────────────────────────
+    # ──────────────────────────────────────────────
     # Trader Analytics
     # ──────────────────────────────────────────────
 
     async def get_market_trades(self, condition_id: str, limit: int = 500) -> list[dict]:
         """
-        Fetch recent trades for a market via the CLOB API.
-        Uses conditionId (0x...) as the market identifier.
-        Response fields: maker, taker, price, size, side, timestamp
+        Fetch recent trades for a market via Gamma API (public, no auth).
+        GET /trades?market={conditionId}&limit={n}
+        Response fields: proxyWallet, side, price, size, timestamp, outcome
         """
         try:
-            # CLOB /trades endpoint - uses conditionId
             params = {"market": condition_id, "limit": limit}
-            async with self.session.get(f"{CLOB_API}/trades", params=params) as resp:
-                logger.debug(f"CLOB /trades status={resp.status} market={condition_id[:16]}...")
+            async with self.session.get(f"{GAMMA_API}/trades", params=params) as resp:
+                logger.info(f"Gamma /trades status={resp.status} market={condition_id[:16]}...")
                 if resp.status == 200:
                     data = await resp.json()
                     trades = data if isinstance(data, list) else data.get("data", [])
-                    logger.debug(f"  Got {len(trades)} trades, sample keys: {list(trades[0].keys()) if trades else 'none'}")
+                    if trades:
+                        logger.info(f"  Got {len(trades)} trades, keys: {list(trades[0].keys())[:8]}")
+                    else:
+                        logger.info(f"  Got 0 trades")
                     return trades
                 else:
                     body = await resp.text()
-                    logger.warning(f"CLOB /trades {resp.status}: {body[:100]}")
+                    logger.warning(f"Gamma /trades {resp.status}: {body[:100]}")
         except Exception as e:
             logger.error(f"Error fetching trades for {condition_id}: {e}")
         return []
 
-    async def get_trader_pnl(self, address: str) -> dict:
+    async def get_trader_activity(self, address: str, limit: int = 200) -> list[dict]:
         """
-        Fetch a trader's P&L stats from the Data API /activity endpoint.
-        Computes win_rate and total_pnl from their resolved trades.
+        Fetch a user's trade history from Data API (public, no auth).
+        GET /activity?user={address}&type=TRADE&limit={n}
+        Response fields: proxyWallet, side, price, size, cashPnl, conditionId, outcome
         """
         try:
-            # Data API /activity - returns per-trade history for a user
-            params = {
-                "user": address.lower(),
-                "type": "TRADE",
-                "limit": 500,
-            }
+            params = {"user": address.lower(), "type": "TRADE", "limit": limit}
             async with self.session.get(f"{DATA_API}/activity", params=params) as resp:
-                logger.debug(f"DATA /activity status={resp.status} user={address[:10]}...")
-                if resp.status != 200:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data if isinstance(data, list) else data.get("data", [])
+                else:
                     body = await resp.text()
-                    logger.debug(f"  Activity {resp.status}: {body[:80]}")
-                    return {}
-                data = await resp.json()
-                trades = data if isinstance(data, list) else data.get("data", [])
-
-            if not trades:
-                return {}
-
-            # Log field names from first trade so we can debug
-            if trades:
-                logger.debug(f"  Activity fields: {list(trades[0].keys())}")
-
-            # Calculate win rate from resolved positions
-            # Each trade has: side (BUY/SELL), price, size, outcome (Win/Lose or similar)
-            wins = losses = 0
-            total_pnl = 0.0
-            for t in trades:
-                # Try multiple possible field names from different API versions
-                outcome = (t.get("outcome") or t.get("result") or "").upper()
-                cash_pnl = float(t.get("cashPnl") or t.get("pnl") or t.get("profit") or 0)
-                total_pnl += cash_pnl
-                if outcome in ("WIN", "YES", "UP", "CORRECT"):
-                    wins += 1
-                elif outcome in ("LOSE", "LOSS", "NO", "DOWN", "INCORRECT"):
-                    losses += 1
-
-            total = wins + losses
-            win_rate = wins / total if total > 0 else 0.0
-            return {
-                "win_rate": win_rate,
-                "total_trades": len(trades),
-                "resolved_trades": total,
-                "total_pnl": total_pnl,
-            }
+                    logger.debug(f"Activity {resp.status} for {address[:10]}: {body[:80]}")
         except Exception as e:
-            logger.error(f"Error fetching trader activity {address}: {e}")
-        return {}
+            logger.error(f"Error fetching activity for {address}: {e}")
+        return []
 
     async def get_profitable_traders(
         self,
         market_ids: list[str],
         condition_ids: list[str],
-        min_win_rate: float = 0.60,
-        min_trades: int = 10,
+        min_win_rate: float = 0.55,
+        min_trades: int = 5,
         top_n: int = 10,
     ) -> list[dict]:
         """
         Scan recent trades across our 4 markets to find profitable traders.
-
-        Step 1: collect unique wallet addresses from trade history
-        Step 2: fetch activity history for top traders by volume
-        Step 3: filter by win rate and min trades, score by win_rate * pnl
+        Uses Gamma /trades (public) for market-level trade history.
+        Uses Data API /activity (public) for per-user PnL stats.
         """
         trader_volume: dict[str, float] = {}
-        trader_trade_count: dict[str, int] = {}
+        trader_count: dict[str, int] = {}
 
-        # Fetch trades using conditionId (required by CLOB API)
         ids_to_scan = condition_ids[:4] if condition_ids else market_ids[:4]
-        logger.info(f"Scanning trades for {len(ids_to_scan)} markets...")
+        logger.info(f"Scanning {len(ids_to_scan)} markets for traders...")
 
         for cid in ids_to_scan:
             trades = await self.get_market_trades(cid)
-            logger.info(f"  conditionId {cid[:16]}...: {len(trades)} trades")
-
             for trade in trades:
-                # CLOB API uses "maker" and "taker" fields
-                for addr_field in ["maker", "taker", "proxyWallet", "trader"]:
-                    addr = (trade.get(addr_field) or "").lower()
-                    if addr and addr != self.wallet_address and len(addr) == 42:
-                        size = float(trade.get("size") or trade.get("amount") or 0)
-                        trader_volume[addr] = trader_volume.get(addr, 0) + size
-                        trader_trade_count[addr] = trader_trade_count.get(addr, 0) + 1
+                # Gamma /trades uses proxyWallet; fallback to other field names
+                addr = (
+                    trade.get("proxyWallet") or
+                    trade.get("maker") or
+                    trade.get("trader") or
+                    trade.get("user") or ""
+                ).lower()
+                if not addr or addr == self.wallet_address or len(addr) != 42:
+                    continue
+                size = float(trade.get("usdcSize") or trade.get("size") or trade.get("amount") or 0)
+                trader_volume[addr] = trader_volume.get(addr, 0) + size
+                trader_count[addr] = trader_count.get(addr, 0) + 1
 
-        logger.info(f"Found {len(trader_volume)} unique traders across all markets")
-
+        logger.info(f"Found {len(trader_volume)} unique traders")
         if not trader_volume:
-            logger.warning("No traders found — trades API may use different field names or markets are too new")
             return []
 
-        # Take top 30 by volume for profile enrichment
+        # Take top 30 traders by volume for activity enrichment
         top_addrs = sorted(trader_volume, key=lambda a: trader_volume[a], reverse=True)[:30]
-        logger.info(f"Fetching activity for top {len(top_addrs)} traders by volume...")
+        logger.info(f"Fetching activity for top {len(top_addrs)} traders...")
 
         enriched = []
         for addr in top_addrs:
-            stats = await self.get_trader_pnl(addr)
-            if not stats:
+            activity = await self.get_trader_activity(addr)
+            if not activity:
                 continue
 
-            wr = stats.get("win_rate", 0)
-            resolved = stats.get("resolved_trades", 0)
-            pnl = stats.get("total_pnl", 0)
-            n_trades = stats.get("total_trades", trader_trade_count.get(addr, 0))
+            # Log field names once for debugging
+            if activity and len(enriched) == 0:
+                logger.info(f"Activity sample keys: {list(activity[0].keys())[:10]}")
+
+            # Compute win rate from resolved trades
+            # cashPnl > 0 = win, < 0 = loss; or use outcome field
+            wins = losses = 0
+            total_pnl = 0.0
+            for t in activity:
+                pnl = float(t.get("cashPnl") or t.get("pnl") or 0)
+                total_pnl += pnl
+                outcome = (t.get("outcome") or "").upper()
+                if outcome in ("WIN", "YES", "UP"):
+                    wins += 1
+                elif outcome in ("LOSE", "LOSS", "NO", "DOWN"):
+                    losses += 1
+                elif pnl > 0:
+                    wins += 1
+                elif pnl < 0:
+                    losses += 1
+
+            resolved = wins + losses
+            win_rate = wins / resolved if resolved > 0 else 0.0
 
             logger.debug(
-                f"  {addr[:10]}... trades={n_trades} resolved={resolved} "
-                f"wr={wr:.1%} pnl=${pnl:.2f}"
+                f"  {addr[:10]}... market_trades={trader_count.get(addr,0)} "
+                f"activity={len(activity)} resolved={resolved} wr={win_rate:.1%} pnl=${total_pnl:.2f}"
             )
 
-            if resolved < min_trades or wr < min_win_rate:
+            if resolved < min_trades or win_rate < min_win_rate:
                 continue
 
-            score = wr * max(pnl, 0.01)
             enriched.append({
                 "address": addr,
-                "win_rate": wr,
-                "total_trades": n_trades,
-                "total_pnl": pnl,
-                "score": score,
+                "win_rate": win_rate,
+                "total_trades": len(activity),
+                "total_pnl": total_pnl,
+                "score": win_rate * max(total_pnl, 0.01),
             })
 
         enriched.sort(key=lambda t: t["score"], reverse=True)
-        logger.info(f"Found {len(enriched)} traders meeting criteria (wr>={min_win_rate:.0%}, trades>={min_trades})")
+        logger.info(f"Qualified traders: {len(enriched)} (wr>={min_win_rate:.0%}, resolved>={min_trades})")
         return enriched[:top_n]
 
     async def get_trader_open_positions(self, address: str, condition_ids: list[str]) -> list[dict]:
         """Check if a tracked trader has open positions in our markets."""
         positions = []
         try:
-            params = {"user": address.lower(), "sizeThreshold": "0.01"}
+            params = {"user": address.lower()}
             async with self.session.get(f"{DATA_API}/positions", params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -344,8 +328,6 @@ class PolymarketClient:
             logger.error(f"Error fetching positions for {address}: {e}")
         return positions
 
-
-    # ──────────────────────────────────────────────
     # Order Placement
     # ──────────────────────────────────────────────
 
