@@ -73,16 +73,16 @@ class PolymarketClient:
     async def get_active_crypto_markets(self) -> list[dict]:
         """
         Fetch active BTC/ETH 5min and 15min up/down markets from Gamma API.
-        Returns list of market dicts with id, question, tokens, etc.
+        Uses strict word-boundary matching to avoid false positives like
+        "netherlands" matching "eth".
         """
         markets = []
         try:
-            # Search for short-term crypto markets
+            # Fetch a broad set then filter strictly client-side
             params = {
                 "active": "true",
                 "closed": "false",
-                "limit": 100,
-                "tag_slug": "crypto",
+                "limit": 200,
             }
             async with self.session.get(f"{GAMMA_API}/markets", params=params) as resp:
                 if resp.status != 200:
@@ -93,36 +93,43 @@ class PolymarketClient:
             all_markets = data if isinstance(data, list) else data.get("markets", [])
 
             for market in all_markets:
-                question = (market.get("question") or "").lower()
-                slug = (market.get("slug") or "").lower()
+                question = (market.get("question") or "")
+                slug = (market.get("slug") or "")
+                q_lower = question.lower()
+                s_lower = slug.lower()
+                combined = q_lower + " " + s_lower
 
-                # Filter for BTC/ETH price movement markets
-                is_crypto = any(
-                    kw in question or kw in slug
-                    for kw in ["btc", "bitcoin", "eth", "ethereum"]
-                )
+                asset = self._detect_asset(combined)
+                if not asset:
+                    continue
+
+                timeframe = self._detect_timeframe(combined)
+                if timeframe == "unknown":
+                    continue
+
+                # Must be a price direction market
                 is_price_move = any(
-                    kw in question
-                    for kw in ["higher", "lower", "above", "below", "up", "down", "5-minute", "15-minute", "5 min", "15 min"]
+                    kw in combined for kw in [
+                        "higher", "lower", "above", "below",
+                        "will go up", "will go down",
+                        "price increase", "price decrease",
+                    ]
                 )
+                if not is_price_move:
+                    continue
 
-                if is_crypto and is_price_move:
-                    # Parse timeframe
-                    timeframe = self._detect_timeframe(question + slug)
-                    asset = "BTC" if any(k in question or k in slug for k in ["btc", "bitcoin"]) else "ETH"
-
-                    markets.append({
-                        "id": market.get("id"),
-                        "condition_id": market.get("conditionId"),
-                        "question": market.get("question"),
-                        "slug": market.get("slug"),
-                        "asset": asset,
-                        "timeframe": timeframe,
-                        "tokens": market.get("tokens", []),
-                        "volume": float(market.get("volume", 0)),
-                        "liquidity": float(market.get("liquidity", 0)),
-                        "end_date": market.get("endDate"),
-                    })
+                markets.append({
+                    "id": market.get("id"),
+                    "condition_id": market.get("conditionId"),
+                    "question": question,
+                    "slug": slug,
+                    "asset": asset,
+                    "timeframe": timeframe,
+                    "tokens": market.get("tokens", []),
+                    "volume": float(market.get("volume") or 0),
+                    "liquidity": float(market.get("liquidity") or 0),
+                    "end_date": market.get("endDate"),
+                })
 
             # Sort by volume descending
             markets.sort(key=lambda m: m["volume"], reverse=True)
@@ -133,13 +140,33 @@ class PolymarketClient:
 
         return markets
 
+    def _detect_asset(self, text: str) -> str:
+        """
+        Strict asset detection using word boundaries.
+        Avoids "eth" matching "netherlands", "method", etc.
+        """
+        import re
+        # BTC: match "btc" or "bitcoin" as whole words
+        if re.search(r"\bbtc\b|\bbitcoin\b", text):
+            return "BTC"
+        # ETH: match "eth" or "ethereum" as whole words only
+        # \b ensures we don't match "neth", "meth", "method", etc.
+        if re.search(r"\beth\b|\bethereum\b", text):
+            return "ETH"
+        return ""
+
     def _detect_timeframe(self, text: str) -> str:
-        text = text.lower()
-        if "15" in text:
+        """
+        Detect 5-minute or 15-minute timeframes from market question/slug.
+        Requires explicit minute references to avoid false positives.
+        """
+        import re
+        # 15-minute must come before 5-minute check
+        if re.search(r"15.?min|15.?minute|15m\b", text):
             return "15min"
-        elif "5" in text:
+        if re.search(r"\b5.?min|\b5.?minute|\b5m\b", text):
             return "5min"
-        elif "1 hour" in text or "1-hour" in text:
+        if re.search(r"1.?hour|60.?min", text):
             return "1hr"
         return "unknown"
 
