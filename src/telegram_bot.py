@@ -80,8 +80,28 @@ class TelegramBot:
         self.trading_bot.add_status_callback(self.broadcast_message)
 
         await self.app.initialize()
+        # Kill any existing webhook and wait for old polling instance to die.
+        # Railway overlaps old+new containers during deploy, so we retry
+        # with backoff until Telegram stops reporting a conflict.
+        import asyncio as _asyncio
+        await self.app.bot.delete_webhook(drop_pending_updates=True)
         await self.app.start()
-        await self.app.updater.start_polling(drop_pending_updates=True)
+
+        for attempt in range(12):  # up to ~60s of retries
+            try:
+                await self.app.updater.start_polling(
+                    drop_pending_updates=True,
+                    allowed_updates=["message", "callback_query"],
+                )
+                break  # success
+            except Exception as e:
+                if "conflict" in str(e).lower() and attempt < 11:
+                    wait = 5 * (attempt + 1)
+                    logger.warning(f"Telegram conflict (attempt {attempt+1}/12), retrying in {wait}s...")
+                    await _asyncio.sleep(wait)
+                else:
+                    raise
+
         logger.info("🤖 Telegram bot started")
 
     async def stop(self):
@@ -265,99 +285,104 @@ class TelegramBot:
 
         data = query.data
 
-        if data == "stats":
-            stats = await self.trading_bot.get_stats()
-            pnl_emoji = "📈" if stats["total_pnl"] >= 0 else "📉"
-            text = (
-                f"📊 *Statistics*\n\n"
-                f"Open: {stats['open_positions']} | Closed: {stats['closed_positions']}\n"
-                f"Win Rate: {stats['win_rate']:.1%}\n"
-                f"{pnl_emoji} Realized: ${stats['total_pnl']:+.2f}\n"
-                f"💫 Unrealized: ${stats['unrealized_pnl']:+.2f}\n"
-                f"Stake: ${stats['stake_usdc']}"
-            )
-            await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
-                                          reply_markup=build_main_keyboard(self.trading_bot))
-
-        elif data == "positions":
-            positions = await self.trading_bot.get_open_positions()
-            if not positions:
-                text = "No open positions."
-            else:
-                lines = [f"📋 *{len(positions)} Open Position(s)*\n"]
-                for p in positions:
-                    current = p.current_price or p.entry_price
-                    pnl = (current * p.shares) - p.stake_usdc
-                    emoji = "🟢" if p.direction == "UP" else "🔴"
-                    lines.append(f"{emoji} {p.asset} {p.direction} | ${pnl:+.2f}")
+        try:
+            if data == "stats":
+                stats = await self.trading_bot.get_stats()
+                pnl_emoji = "📈" if stats["total_pnl"] >= 0 else "📉"
+                lines = [
+                    "📊 *Statistics*\n",
+                    f"Open: {stats['open_positions']} | Closed: {stats['closed_positions']}",
+                    f"Win Rate: {stats['win_rate']:.1%}",
+                    f"{pnl_emoji} Realized: ${stats['total_pnl']:+.2f}",
+                    f"💫 Unrealized: ${stats['unrealized_pnl']:+.2f}",
+                    f"Stake: ${stats['stake_usdc']}",
+                ]
                 text = "\n".join(lines)
-            await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
-                                          reply_markup=build_main_keyboard(self.trading_bot))
-
-        elif data == "traders":
-            traders = await self.trading_bot.get_tracked_traders()
-            if not traders:
-                text = "No traders tracked yet."
-            else:
-                lines = [f"👥 *{len(traders)} Tracked Traders*\n"]
-                for t in traders[:5]:
-                    lines.append(f"`{t.address[:8]}...` WR:{t.win_rate:.0%} PnL:${t.total_pnl:+.0f}")
-                text = "\n".join(lines)
-            await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
-                                          reply_markup=build_main_keyboard(self.trading_bot))
-
-        elif data == "markets":
-            summary = self.trading_bot.get_markets_summary()
-            text = f"🏦 *Markets*\n\n{summary}" if summary else "No markets loaded yet."
-            await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
-                                          reply_markup=build_main_keyboard(self.trading_bot))
-
-        elif data == "toggle_copy":
-            enabled = await self.trading_bot.toggle_copy_trading()
-            status = "✅ ENABLED" if enabled else "❌ DISABLED"
-            await query.edit_message_text(
-                f"Copy trading {status}",
-                reply_markup=build_main_keyboard(self.trading_bot)
-            )
-
-        elif data == "set_stake":
-            self._awaiting_stake.add(user_id)
-            await query.edit_message_text(
-                f"💰 Enter stake amount in USDC\n(current: ${self.trading_bot.stake_usdc}, "
-                f"max: ${self.trading_bot.max_stake_usdc}):"
-            )
-
-        elif data == "history":
-            closed = await self.trading_bot.get_recent_closed(5)
-            if not closed:
-                text = "No closed trades yet."
-            else:
-                lines = ["📜 *Recent Trades*\n"]
-                for p in closed:
-                    emoji = "✅" if (p.pnl_usdc or 0) > 0 else "❌"
-                    lines.append(
-                        f"{emoji} {p.asset} {p.direction} ({p.timeframe})\n"
-                        f"   PnL: ${p.pnl_usdc:+.2f}"
-                    )
-                text = "\n".join(lines)
-            await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
-                                          reply_markup=build_main_keyboard(self.trading_bot))
-
-        elif data == "start_bot":
-            if not self.trading_bot.running:
-                await self.trading_bot.start()
-                await query.edit_message_text("🚀 Bot started!",
+                await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
                                               reply_markup=build_main_keyboard(self.trading_bot))
-            else:
-                await query.answer("Bot is already running!", show_alert=True)
 
-        elif data == "stop_bot":
-            if self.trading_bot.running:
-                await self.trading_bot.stop()
-                await query.edit_message_text("⏹ Bot stopped.",
+            elif data == "positions":
+                positions = await self.trading_bot.get_open_positions()
+                if not positions:
+                    text = "No open positions."
+                else:
+                    lines = [f"📋 *{len(positions)} Open Position(s)*\n"]
+                    for p in positions:
+                        current = p.current_price or p.entry_price
+                        pnl = (current * p.shares) - p.stake_usdc
+                        emoji = "🟢" if p.direction == "UP" else "🔴"
+                        lines.append(f"{emoji} {p.asset} {p.direction} | ${pnl:+.2f}")
+                    text = "\n".join(lines)
+                await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
                                               reply_markup=build_main_keyboard(self.trading_bot))
-            else:
-                await query.answer("Bot is already stopped!", show_alert=True)
+
+            elif data == "traders":
+                traders = await self.trading_bot.get_tracked_traders()
+                if not traders:
+                    text = "No traders tracked yet."
+                else:
+                    lines = [f"👥 *{len(traders)} Tracked Traders*\n"]
+                    for t in traders[:5]:
+                        lines.append(f"`{t.address[:8]}...` WR:{t.win_rate:.0%} PnL:${t.total_pnl:+.0f}")
+                    text = "\n".join(lines)
+                await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
+                                              reply_markup=build_main_keyboard(self.trading_bot))
+
+            elif data == "markets":
+                summary = self.trading_bot.get_markets_summary()
+                text = ("🏦 *Markets*\n\n" + summary) if summary else "No markets loaded yet."
+                await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
+                                              reply_markup=build_main_keyboard(self.trading_bot))
+
+            elif data == "toggle_copy":
+                enabled = await self.trading_bot.toggle_copy_trading()
+                status = "✅ ENABLED" if enabled else "❌ DISABLED"
+                await query.edit_message_text(
+                    "Copy trading " + status,
+                    reply_markup=build_main_keyboard(self.trading_bot)
+                )
+
+            elif data == "set_stake":
+                self._awaiting_stake.add(user_id)
+                await query.edit_message_text(
+                    "💰 Enter stake amount in USDC\n"
+                    f"(current: ${self.trading_bot.stake_usdc}, max: ${self.trading_bot.max_stake_usdc}):"
+                )
+
+            elif data == "history":
+                closed = await self.trading_bot.get_recent_closed(5)
+                if not closed:
+                    text = "No closed trades yet."
+                else:
+                    lines = ["📜 *Recent Trades*\n"]
+                    for p in closed:
+                        emoji = "✅" if (p.pnl_usdc or 0) > 0 else "❌"
+                        lines.append(f"{emoji} {p.asset} {p.direction} ({p.timeframe})")
+                        lines.append(f"   PnL: ${p.pnl_usdc:+.2f}")
+                    text = "\n".join(lines)
+                await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
+                                              reply_markup=build_main_keyboard(self.trading_bot))
+
+            elif data == "start_bot":
+                if not self.trading_bot.running:
+                    await self.trading_bot.start()
+                    await query.edit_message_text("🚀 Bot started!",
+                                                  reply_markup=build_main_keyboard(self.trading_bot))
+                else:
+                    await query.answer("Bot is already running!", show_alert=True)
+
+            elif data == "stop_bot":
+                if self.trading_bot.running:
+                    await self.trading_bot.stop()
+                    await query.edit_message_text("⏹ Bot stopped.",
+                                                  reply_markup=build_main_keyboard(self.trading_bot))
+                else:
+                    await query.answer("Bot is already stopped!", show_alert=True)
+
+        except Exception as e:
+            err = str(e).lower()
+            if "not modified" not in err and "query is too old" not in err:
+                logger.error(f"Callback handler error: {e}")
 
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
