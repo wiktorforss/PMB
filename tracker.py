@@ -229,8 +229,8 @@ def discover_candle_markets() -> dict:
 # ─── Step 2: Pull Recent Trades Per Market ────────────────────────────────────
 def fetch_market_trades(condition_id: str) -> list:
     data = _get(f"{DATA_API}/trades", params={
-        "market": condition_id,
-        "limit":  TRADES_PER_MARKET,
+        "conditionId": condition_id,
+        "limit":       TRADES_PER_MARKET,
     })
     if not data:
         return []
@@ -306,15 +306,17 @@ def update_trader_ledger(_open_markets: dict):
             time.sleep(REQUEST_DELAY_S)
 
             for t in trades:
-                wallet     = t.get("maker") or t.get("user") or t.get("trader")
-                t_outcome  = (t.get("outcome") or t.get("side") or "").capitalize()
-                size       = float(t.get("size")  or t.get("amount") or 0)
+                # Confirmed field names from data-api.polymarket.com/trades docs:
+                # proxyWallet, side ("BUY"/"SELL"), outcome, size, price
+                wallet     = t.get("proxyWallet")
+                t_outcome  = (t.get("outcome") or "").capitalize()  # "Up" / "Down"
+                side       = (t.get("side") or "").upper()          # "BUY" / "SELL"
+                size       = float(t.get("size")  or 0)
                 price      = float(t.get("price") or 0)
                 usd_val    = size * price
-                trade_type = (t.get("type") or "").upper()
 
                 # Only count BUY trades (opening a position), skip dust
-                if trade_type == "SELL" or usd_val < 1 or not wallet:
+                if side == "SELL" or usd_val < 1 or not wallet:
                     continue
 
                 if wallet not in ledger:
@@ -384,11 +386,13 @@ def fetch_wallet_positions(wallet: str) -> dict:
     positions = data if isinstance(data, list) else data.get("data", [])
     result = {}
     for p in positions:
-        cid     = p.get("conditionId") or p.get("condition_id") or p.get("market")
-        outcome = p.get("outcome") or p.get("side")
-        size    = float(p.get("size") or p.get("amount") or 0)
-        price   = float(p.get("avgPrice") or p.get("price") or 0)
-        usd     = size * price
+        # Confirmed field names from data-api positions docs:
+        # conditionId, outcome, size, avgPrice, currentValue
+        cid     = p.get("conditionId")
+        outcome = (p.get("outcome") or "").capitalize()   # "Up" / "Down"
+        size    = float(p.get("size")     or 0)
+        price   = float(p.get("avgPrice") or p.get("curPrice") or 0)
+        usd     = float(p.get("currentValue") or size * price)
         if cid and usd >= MIN_POSITION_USD:
             result[cid] = {"outcome": outcome, "size_usd": usd, "price": price}
     return result
