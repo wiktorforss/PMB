@@ -236,58 +236,112 @@ def fetch_market_trades(condition_id: str) -> list:
         return []
     return data if isinstance(data, list) else data.get("data", [])
 
-# ─── Step 3: Score Traders on Candle Markets ──────────────────────────────────
-def update_trader_ledger(markets: dict):
-    """
-    For every known candle market with a resolved outcome,
-    mark each trader's trade as a win or loss and track volume.
-    """
-    ledger = state["trader_ledger"]
 
-    for cid, mkt in markets.items():
-        trades = fetch_market_trades(cid)
+def fetch_recent_closed_markets(series_slug: str, limit: int = 30) -> list:
+    """Fetch recently resolved candle markets for a given series."""
+    data = _get(f"{GAMMA_API}/events", params={
+        "seriesSlug": series_slug,
+        "closed":     "true",
+        "order":      "id",
+        "ascending":  "false",
+        "limit":      limit,
+    })
+    if not data:
+        return []
+    return data if isinstance(data, list) else data.get("data", [])
+
+
+def _resolved_outcome(market: dict) -> str | None:
+    """
+    Extract the winning outcome from a resolved market.
+    Polymarket sets the winning token price to 1.0 on resolution.
+    e.g. outcomes=["Up","Down"], outcomePrices=["1","0"] -> "Up" won.
+    """
+    raw_outcomes = market.get("outcomes", '["Up","Down"]')
+    raw_prices   = market.get("outcomePrices", '["0.5","0.5"]')
+    try:
+        if isinstance(raw_outcomes, str):
+            raw_outcomes = json.loads(raw_outcomes)
+        if isinstance(raw_prices, str):
+            raw_prices = json.loads(raw_prices)
+        prices  = [float(p) for p in raw_prices]
+        max_idx = prices.index(max(prices))
+        if max(prices) >= 0.99:   # confirmed resolved, not just 50/50
+            return raw_outcomes[max_idx]
+    except Exception:
+        pass
+    return None
+
+
+# ─── Step 3: Score Traders on Candle Markets ──────────────────────────────────
+def update_trader_ledger(_open_markets: dict):
+    """
+    Build win/loss history by processing recently CLOSED candle markets.
+    For each closed market:
+      1. Determine resolved outcome from outcomePrices (price ~1.0 = winner)
+      2. Fetch all trades for that market from data-api
+      3. Credit each wallet a win or loss based on which side they bought
+    """
+    ledger  = state["trader_ledger"]
+    scored  = state.get("_scored_markets", set())
+
+    for series in CANDLE_SERIES:
+        closed_events = fetch_recent_closed_markets(series["slug"], limit=30)
         time.sleep(REQUEST_DELAY_S)
 
-        # Determine resolved outcome if available
-        resolved = mkt.get("resolved_outcome")  # set by market refresh
-
-        for t in trades:
-            wallet  = t.get("maker") or t.get("user") or t.get("trader")
-            outcome = t.get("outcome") or t.get("side")    # "YES"/"NO"
-            size    = float(t.get("size") or t.get("amount") or 0)
-            price   = float(t.get("price") or 0)
-            usd_val = size * price
-
-            if not wallet or usd_val < 1:
+        for event in closed_events:
+            markets = event.get("markets", [])
+            if not markets:
                 continue
+            m   = markets[0]
+            cid = m.get("conditionId")
+            if not cid or cid in scored:
+                continue   # already processed
 
-            if wallet not in ledger:
-                ledger[wallet] = {
-                    "wins": 0, "losses": 0,
-                    "volume_usd": 0.0,
-                    "markets_traded": set(),
-                    "last_seen": None,
-                }
+            resolved = _resolved_outcome(m)
+            if not resolved:
+                continue   # not yet resolved (still 0.5/0.5)
 
-            entry = ledger[wallet]
-            entry["volume_usd"] += usd_val
-            entry["markets_traded"].add(cid)
-            entry["last_seen"] = datetime.now(timezone.utc).isoformat()
+            trades = fetch_market_trades(cid)
+            time.sleep(REQUEST_DELAY_S)
 
-            # Score win/loss only for resolved markets
-            if resolved and outcome:
-                if outcome.upper() == resolved.upper():
-                    entry["wins"] += 1
-                else:
-                    entry["losses"] += 1
+            for t in trades:
+                wallet     = t.get("maker") or t.get("user") or t.get("trader")
+                t_outcome  = (t.get("outcome") or t.get("side") or "").capitalize()
+                size       = float(t.get("size")  or t.get("amount") or 0)
+                price      = float(t.get("price") or 0)
+                usd_val    = size * price
+                trade_type = (t.get("type") or "").upper()
 
-    # Serialise sets for JSON
-    for w, e in ledger.items():
-        if isinstance(e.get("markets_traded"), set):
-            e["markets_traded"] = list(e["markets_traded"])
+                # Only count BUY trades (opening a position), skip dust
+                if trade_type == "SELL" or usd_val < 1 or not wallet:
+                    continue
 
+                if wallet not in ledger:
+                    ledger[wallet] = {
+                        "wins": 0, "losses": 0,
+                        "volume_usd": 0.0,
+                        "last_seen": None,
+                    }
+
+                entry = ledger[wallet]
+                entry["volume_usd"] += usd_val
+                entry["last_seen"]   = datetime.now(timezone.utc).isoformat()
+
+                if t_outcome:
+                    if t_outcome == resolved:
+                        entry["wins"]   += 1
+                    else:
+                        entry["losses"] += 1
+
+            scored.add(cid)
+
+    state["_scored_markets"] = scored
+    # Persist scored market IDs inside the ledger file under a reserved key
+    ledger["_scored"] = list(scored)
     _save(LEDGER_FILE, ledger)
-    log.info(f"Ledger updated: {len(ledger)} traders tracked")
+    ledger.pop("_scored", None)   # remove from in-memory ledger so rank_traders ignores it
+    log.info(f"Ledger updated: {len(ledger)} traders tracked, {len(scored)} markets scored")
 
 def rank_traders() -> list:
     """
@@ -482,9 +536,24 @@ def _execute_buy(cid, outcome, mkt_info, size_usd, price):
 def main_loop():
     last_market_refresh = 0
     last_trader_refresh = 0
+    last_day            = today_key()
 
     while True:
         now = time.time()
+
+        # Reset daily counters at midnight UTC
+        current_day = today_key()
+        if current_day != last_day:
+            state["bought"]["spent_today"] = 0.0
+            state["stats"]["signals_today"] = 0
+            _save(BOUGHT_FILE, state["bought"])
+            log.info("Daily counters reset")
+            last_day = current_day
+
+        # Honour /pause command
+        if state["settings"].get("paused"):
+            time.sleep(POLL_INTERVAL_S)
+            continue
 
         # Refresh candle market list
         if now - last_market_refresh > MARKET_REFRESH_S:
@@ -493,7 +562,7 @@ def main_loop():
                 state["stats"]["markets_tracked"] = len(state["active_markets"])
             last_market_refresh = now
 
-        # Update trader ledger & re-rank
+        # Update trader ledger & re-rank (uses closed markets, not open ones)
         if now - last_trader_refresh > TRADER_REFRESH_S:
             with state_lock:
                 update_trader_ledger(state["active_markets"])
@@ -501,13 +570,13 @@ def main_loop():
                 state["stats"]["traders_scored"] = len(state["top_traders"])
             last_trader_refresh = now
 
-        # Scan positions of top traders
+        # Scan live positions of top traders in active candle markets
         signals = scan_top_trader_positions()
 
         with state_lock:
             state["signals"] = {k: dict(v) for k, v in signals.items()}
 
-        # Fire alerts
+        # Fire alerts and auto-buy
         for cid, outcomes in signals.items():
             mkt_info = state["active_markets"].get(cid, {})
             for outcome, holders in outcomes.items():
@@ -693,8 +762,12 @@ def api_stats():
 if __name__ == "__main__":
     log.info("PMB Candle Copy Trader starting…")
 
-    # Load persisted ledger
+    # Load persisted state
     state["trader_ledger"] = _load(LEDGER_FILE, {})
+    # Restore set of already-scored market conditionIds to avoid re-processing
+    # (stored flat in ledger file under special key "_scored")
+    scored_raw = state["trader_ledger"].pop("_scored", [])
+    state["_scored_markets"] = set(scored_raw)
 
     # Start background threads
     threading.Thread(target=main_loop,         daemon=True).start()
