@@ -173,121 +173,177 @@ class PolymarketClient:
     # Trader Analytics
     # ──────────────────────────────────────────────
 
-    async def get_market_trades(self, market_id: str, limit: int = 200) -> list[dict]:
-        """Fetch recent trades for a market."""
+    async def get_market_trades(self, condition_id: str, limit: int = 500) -> list[dict]:
+        """
+        Fetch recent trades for a market via the CLOB API.
+        Uses conditionId (0x...) as the market identifier.
+        Response fields: maker, taker, price, size, side, timestamp
+        """
         try:
-            params = {"market": market_id, "limit": limit}
-            async with self.session.get(f"{DATA_API}/trades", params=params) as resp:
+            # CLOB /trades endpoint - uses conditionId
+            params = {"market": condition_id, "limit": limit}
+            async with self.session.get(f"{CLOB_API}/trades", params=params) as resp:
+                logger.debug(f"CLOB /trades status={resp.status} market={condition_id[:16]}...")
                 if resp.status == 200:
                     data = await resp.json()
-                    return data if isinstance(data, list) else data.get("data", [])
+                    trades = data if isinstance(data, list) else data.get("data", [])
+                    logger.debug(f"  Got {len(trades)} trades, sample keys: {list(trades[0].keys()) if trades else 'none'}")
+                    return trades
+                else:
+                    body = await resp.text()
+                    logger.warning(f"CLOB /trades {resp.status}: {body[:100]}")
         except Exception as e:
-            logger.error(f"Error fetching trades for {market_id}: {e}")
+            logger.error(f"Error fetching trades for {condition_id}: {e}")
         return []
 
-    async def get_trader_profile(self, address: str) -> dict:
+    async def get_trader_pnl(self, address: str) -> dict:
         """
-        Fetch a trader's historical performance from Polymarket data API.
-        Returns win_rate, total_trades, total_pnl, etc.
+        Fetch a trader's P&L stats from the Data API /activity endpoint.
+        Computes win_rate and total_pnl from their resolved trades.
         """
         try:
-            async with self.session.get(
-                f"{DATA_API}/portfolio",
-                params={"user": address.lower()}
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.json()
+            # Data API /activity - returns per-trade history for a user
+            params = {
+                "user": address.lower(),
+                "type": "TRADE",
+                "limit": 500,
+            }
+            async with self.session.get(f"{DATA_API}/activity", params=params) as resp:
+                logger.debug(f"DATA /activity status={resp.status} user={address[:10]}...")
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.debug(f"  Activity {resp.status}: {body[:80]}")
+                    return {}
+                data = await resp.json()
+                trades = data if isinstance(data, list) else data.get("data", [])
+
+            if not trades:
+                return {}
+
+            # Log field names from first trade so we can debug
+            if trades:
+                logger.debug(f"  Activity fields: {list(trades[0].keys())}")
+
+            # Calculate win rate from resolved positions
+            # Each trade has: side (BUY/SELL), price, size, outcome (Win/Lose or similar)
+            wins = losses = 0
+            total_pnl = 0.0
+            for t in trades:
+                # Try multiple possible field names from different API versions
+                outcome = (t.get("outcome") or t.get("result") or "").upper()
+                cash_pnl = float(t.get("cashPnl") or t.get("pnl") or t.get("profit") or 0)
+                total_pnl += cash_pnl
+                if outcome in ("WIN", "YES", "UP", "CORRECT"):
+                    wins += 1
+                elif outcome in ("LOSE", "LOSS", "NO", "DOWN", "INCORRECT"):
+                    losses += 1
+
+            total = wins + losses
+            win_rate = wins / total if total > 0 else 0.0
+            return {
+                "win_rate": win_rate,
+                "total_trades": len(trades),
+                "resolved_trades": total,
+                "total_pnl": total_pnl,
+            }
         except Exception as e:
-            logger.error(f"Error fetching trader profile {address}: {e}")
+            logger.error(f"Error fetching trader activity {address}: {e}")
         return {}
 
     async def get_profitable_traders(
         self,
         market_ids: list[str],
+        condition_ids: list[str],
         min_win_rate: float = 0.60,
-        min_trades: int = 20,
+        min_trades: int = 10,
         top_n: int = 10,
     ) -> list[dict]:
         """
-        Analyze recent market trades to find profitable traders.
-        Scores traders by win rate × total PnL.
+        Scan recent trades across our 4 markets to find profitable traders.
+
+        Step 1: collect unique wallet addresses from trade history
+        Step 2: fetch activity history for top traders by volume
+        Step 3: filter by win rate and min trades, score by win_rate * pnl
         """
-        trader_stats: dict[str, dict] = {}
+        trader_volume: dict[str, float] = {}
+        trader_trade_count: dict[str, int] = {}
 
-        for market_id in market_ids:
-            trades = await self.get_market_trades(market_id)
+        # Fetch trades using conditionId (required by CLOB API)
+        ids_to_scan = condition_ids[:4] if condition_ids else market_ids[:4]
+        logger.info(f"Scanning trades for {len(ids_to_scan)} markets...")
+
+        for cid in ids_to_scan:
+            trades = await self.get_market_trades(cid)
+            logger.info(f"  conditionId {cid[:16]}...: {len(trades)} trades")
+
             for trade in trades:
-                maker = (trade.get("maker_address") or "").lower()
-                taker = (trade.get("taker_address") or "").lower()
+                # CLOB API uses "maker" and "taker" fields
+                for addr_field in ["maker", "taker", "proxyWallet", "trader"]:
+                    addr = (trade.get(addr_field) or "").lower()
+                    if addr and addr != self.wallet_address and len(addr) == 42:
+                        size = float(trade.get("size") or trade.get("amount") or 0)
+                        trader_volume[addr] = trader_volume.get(addr, 0) + size
+                        trader_trade_count[addr] = trader_trade_count.get(addr, 0) + 1
 
-                for addr in [maker, taker]:
-                    if not addr or addr == self.wallet_address:
-                        continue
-                    if addr not in trader_stats:
-                        trader_stats[addr] = {
-                            "address": addr,
-                            "markets_seen": set(),
-                            "trade_count": 0,
-                        }
-                    trader_stats[addr]["markets_seen"].add(market_id)
-                    trader_stats[addr]["trade_count"] += 1
+        logger.info(f"Found {len(trader_volume)} unique traders across all markets")
 
-        # Fetch full profiles for traders with enough activity
+        if not trader_volume:
+            logger.warning("No traders found — trades API may use different field names or markets are too new")
+            return []
+
+        # Take top 30 by volume for profile enrichment
+        top_addrs = sorted(trader_volume, key=lambda a: trader_volume[a], reverse=True)[:30]
+        logger.info(f"Fetching activity for top {len(top_addrs)} traders by volume...")
+
         enriched = []
-        candidates = [
-            t for t in trader_stats.values()
-            if t["trade_count"] >= max(3, min_trades // 5)
-        ]
-        # Limit API calls
-        candidates = sorted(candidates, key=lambda x: x["trade_count"], reverse=True)[:50]
+        for addr in top_addrs:
+            stats = await self.get_trader_pnl(addr)
+            if not stats:
+                continue
 
-        await asyncio.gather(*[
-            self._enrich_trader(t, enriched, min_win_rate, min_trades)
-            for t in candidates
-        ])
+            wr = stats.get("win_rate", 0)
+            resolved = stats.get("resolved_trades", 0)
+            pnl = stats.get("total_pnl", 0)
+            n_trades = stats.get("total_trades", trader_trade_count.get(addr, 0))
 
-        # Sort by score
-        enriched.sort(key=lambda t: t.get("score", 0), reverse=True)
+            logger.debug(
+                f"  {addr[:10]}... trades={n_trades} resolved={resolved} "
+                f"wr={wr:.1%} pnl=${pnl:.2f}"
+            )
+
+            if resolved < min_trades or wr < min_win_rate:
+                continue
+
+            score = wr * max(pnl, 0.01)
+            enriched.append({
+                "address": addr,
+                "win_rate": wr,
+                "total_trades": n_trades,
+                "total_pnl": pnl,
+                "score": score,
+            })
+
+        enriched.sort(key=lambda t: t["score"], reverse=True)
+        logger.info(f"Found {len(enriched)} traders meeting criteria (wr>={min_win_rate:.0%}, trades>={min_trades})")
         return enriched[:top_n]
 
-    async def _enrich_trader(self, trader: dict, result_list: list, min_wr: float, min_trades: int):
-        profile = await self.get_trader_profile(trader["address"])
-        if not profile:
-            return
-
-        total_trades = profile.get("tradesCount", 0) or trader["trade_count"]
-        profit = float(profile.get("profit", 0) or 0)
-        win_rate = float(profile.get("winRate", 0) or 0)
-
-        if total_trades < min_trades or win_rate < min_wr:
-            return
-
-        score = win_rate * max(profit, 0.01)
-        result_list.append({
-            "address": trader["address"],
-            "win_rate": win_rate,
-            "total_trades": total_trades,
-            "total_pnl": profit,
-            "score": score,
-        })
-
-    async def get_trader_open_positions(self, address: str, market_ids: list[str]) -> list[dict]:
+    async def get_trader_open_positions(self, address: str, condition_ids: list[str]) -> list[dict]:
         """Check if a tracked trader has open positions in our markets."""
         positions = []
         try:
-            async with self.session.get(
-                f"{DATA_API}/positions",
-                params={"user": address.lower(), "active": "true"}
-            ) as resp:
+            params = {"user": address.lower(), "sizeThreshold": "0.01"}
+            async with self.session.get(f"{DATA_API}/positions", params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    all_positions = data if isinstance(data, list) else data.get("data", [])
-                    for pos in all_positions:
-                        if pos.get("market") in market_ids:
+                    all_pos = data if isinstance(data, list) else data.get("data", [])
+                    for pos in all_pos:
+                        cid = pos.get("conditionId") or pos.get("market") or ""
+                        if cid in condition_ids:
                             positions.append(pos)
         except Exception as e:
             logger.error(f"Error fetching positions for {address}: {e}")
         return positions
+
 
     # ──────────────────────────────────────────────
     # Order Placement
