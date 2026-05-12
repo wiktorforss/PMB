@@ -72,72 +72,118 @@ class PolymarketClient:
 
     async def get_active_crypto_markets(self) -> list[dict]:
         """
-        Fetch active BTC/ETH 5min and 15min up/down markets from Gamma API.
-        Uses strict word-boundary matching to avoid false positives like
-        "netherlands" matching "eth".
+        Fetch active BTC/ETH 5min and 15min up/down markets.
+
+        Strategy: make separate targeted searches for each asset so we get
+        focused results rather than hoping a generic tag filter works.
+        Then apply strict word-boundary asset detection and explicit
+        timeframe detection to keep only real short-term price markets.
         """
+        seen_ids: set = set()
         markets = []
-        try:
-            # Fetch a broad set then filter strictly client-side
-            params = {
-                "active": "true",
-                "closed": "false",
-                "limit": 200,
-            }
-            async with self.session.get(f"{GAMMA_API}/markets", params=params) as resp:
-                if resp.status != 200:
-                    logger.error(f"Gamma API error: {resp.status}")
-                    return []
-                data = await resp.json()
 
-            all_markets = data if isinstance(data, list) else data.get("markets", [])
+        # Search queries that reliably surface short-term crypto price markets
+        search_terms = [
+            "btc 5 minutes",
+            "btc 15 minutes",
+            "bitcoin 5 minutes",
+            "bitcoin 15 minutes",
+            "eth 5 minutes",
+            "eth 15 minutes",
+            "ethereum 5 minutes",
+            "ethereum 15 minutes",
+            "btc above",
+            "eth above",
+            "bitcoin above",
+            "ethereum above",
+        ]
 
-            for market in all_markets:
-                question = (market.get("question") or "")
-                slug = (market.get("slug") or "")
-                q_lower = question.lower()
-                s_lower = slug.lower()
-                combined = q_lower + " " + s_lower
+        for term in search_terms:
+            try:
+                params = {
+                    "active": "true",
+                    "closed": "false",
+                    "limit": 50,
+                    "search": term,
+                }
+                async with self.session.get(f"{GAMMA_API}/markets", params=params) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
 
-                asset = self._detect_asset(combined)
-                if not asset:
-                    continue
+                raw = data if isinstance(data, list) else data.get("markets", [])
+                for market in raw:
+                    mid = market.get("id")
+                    if not mid or mid in seen_ids:
+                        continue
 
-                timeframe = self._detect_timeframe(combined)
-                if timeframe == "unknown":
-                    continue
+                    question = (market.get("question") or "")
+                    slug = (market.get("slug") or "")
+                    combined = (question + " " + slug).lower()
 
-                # Must be a price direction market
-                is_price_move = any(
-                    kw in combined for kw in [
-                        "higher", "lower", "above", "below",
-                        "will go up", "will go down",
-                        "price increase", "price decrease",
-                    ]
-                )
-                if not is_price_move:
-                    continue
+                    asset = self._detect_asset(combined)
+                    if not asset:
+                        continue
 
-                markets.append({
-                    "id": market.get("id"),
-                    "condition_id": market.get("conditionId"),
-                    "question": question,
-                    "slug": slug,
-                    "asset": asset,
-                    "timeframe": timeframe,
-                    "tokens": market.get("tokens", []),
-                    "volume": float(market.get("volume") or 0),
-                    "liquidity": float(market.get("liquidity") or 0),
-                    "end_date": market.get("endDate"),
-                })
+                    timeframe = self._detect_timeframe(combined)
+                    if timeframe == "unknown":
+                        continue
 
-            # Sort by volume descending
-            markets.sort(key=lambda m: m["volume"], reverse=True)
-            logger.info(f"Found {len(markets)} active crypto markets")
+                    seen_ids.add(mid)
+                    markets.append({
+                        "id": mid,
+                        "condition_id": market.get("conditionId"),
+                        "question": question,
+                        "slug": slug,
+                        "asset": asset,
+                        "timeframe": timeframe,
+                        "tokens": market.get("tokens", []),
+                        "volume": float(market.get("volume") or 0),
+                        "liquidity": float(market.get("liquidity") or 0),
+                        "end_date": market.get("endDate"),
+                    })
 
-        except Exception as e:
-            logger.error(f"Error fetching markets: {e}", exc_info=True)
+            except Exception as e:
+                logger.warning(f"Search '{term}' failed: {e}")
+                continue
 
+        # Fallback: broad fetch if targeted searches returned nothing
+        if not markets:
+            logger.info("Targeted searches returned 0, trying broad fetch...")
+            try:
+                params = {"active": "true", "closed": "false", "limit": 300}
+                async with self.session.get(f"{GAMMA_API}/markets", params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        raw = data if isinstance(data, list) else data.get("markets", [])
+                        for market in raw:
+                            mid = market.get("id")
+                            if not mid or mid in seen_ids:
+                                continue
+                            question = (market.get("question") or "")
+                            slug = (market.get("slug") or "")
+                            combined = (question + " " + slug).lower()
+                            asset = self._detect_asset(combined)
+                            timeframe = self._detect_timeframe(combined)
+                            if asset and timeframe != "unknown":
+                                seen_ids.add(mid)
+                                markets.append({
+                                    "id": mid,
+                                    "condition_id": market.get("conditionId"),
+                                    "question": question,
+                                    "slug": slug,
+                                    "asset": asset,
+                                    "timeframe": timeframe,
+                                    "tokens": market.get("tokens", []),
+                                    "volume": float(market.get("volume") or 0),
+                                    "liquidity": float(market.get("liquidity") or 0),
+                                    "end_date": market.get("endDate"),
+                                })
+            except Exception as e:
+                logger.error(f"Broad fetch failed: {e}")
+
+        markets.sort(key=lambda m: m["volume"], reverse=True)
+        logger.info(f"Found {len(markets)} active crypto markets")
         return markets
 
     def _detect_asset(self, text: str) -> str:
