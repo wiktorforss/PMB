@@ -1,21 +1,34 @@
 """
 PMB — Polymarket Brain | tracker.py
-Market-First Candle Copy Trader
+BTC/ETH Candle Copy Trader — v3 ground-up rewrite
 
-Strategy:
-  1. Discover open BTC/ETH 5min & 15min candle markets
-  2. Pull recent trades per market to find active candle traders
-  3. Score each wallet on candle-market profitability only
-  4. Copy positions from top-performing candle traders in real time
+CONFIRMED API FACTS (verified against live responses):
+  - Market discovery : gamma-api.polymarket.com/events?seriesSlug=btc-up-or-down-5m&closed=false
+  - Trades per market: data-api.polymarket.com/trades?conditionId=0x...&limit=100
+  - User positions   : data-api.polymarket.com/positions?user=0x...
+  - Closed markets   : gamma-api.polymarket.com/events?seriesSlug=...&closed=true
+  - Trade fields     : proxyWallet, side (BUY/SELL), outcome ("Up"/"Down"), size, price
+  - Position fields  : proxyWallet, conditionId, outcome, size, avgPrice, currentValue
+  - Resolution       : outcomePrices ["1","0"] or ["0","1"] when settled (>=0.99)
+
+STRATEGY:
+  1. Every 5 min: fetch last N closed BTC+ETH candle markets, score each
+     trade as win/loss, build a per-wallet ledger.
+  2. Rank wallets by win rate (min MIN_SCORED_TRADES trades, min MIN_WIN_RATE).
+  3. Every 60s: fetch recent trades on open candle markets.
+     If a top-ranked wallet traded BUY within MAX_SIGNAL_AGE_S seconds, signal.
+  4. Alert via Telegram. Auto-buy if enabled.
+
+WHY TRADES NOT POSITIONS:
+  5min candles expire before a positions poll cycle can catch them.
+  Watching trades on open markets is the only reliable real-time approach.
 """
 
-import os, json, time, logging, threading, re
+import os, json, time, logging, threading
 from datetime import datetime, timezone
-from collections import defaultdict
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 import requests
 
-# ─── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -23,801 +36,549 @@ logging.basicConfig(
 )
 log = logging.getLogger("PMB")
 
-# ─── Env / Config ───────────────────────────────────────────────────────────
-GAMMA_API     = "https://gamma-api.polymarket.com"   # market discovery, events, tags
-DATA_API      = "https://data-api.polymarket.com"    # trades, positions, leaderboard
-CLOB_HOST     = "https://clob.polymarket.com"        # order placement
+# ── Config ────────────────────────────────────────────────────────────────────
+GAMMA_API  = "https://gamma-api.polymarket.com"
+DATA_API   = "https://data-api.polymarket.com"
+CLOB_HOST  = "https://clob.polymarket.com"
 
-POLL_INTERVAL_S      = int(os.getenv("POLL_INTERVAL_S",      "60"))    # main loop cadence
-MARKET_REFRESH_S     = int(os.getenv("MARKET_REFRESH_S",     "120"))   # re-discover markets
-TRADER_REFRESH_S     = int(os.getenv("TRADER_REFRESH_S",     "300"))   # re-score traders
-REQUEST_DELAY_S      = float(os.getenv("REQUEST_DELAY_S",    "0.5"))
+POLL_INTERVAL_S   = int(os.getenv("POLL_INTERVAL_S",   "60"))
+LEDGER_REFRESH_S  = int(os.getenv("LEDGER_REFRESH_S",  "300"))
+MARKET_REFRESH_S  = int(os.getenv("MARKET_REFRESH_S",  "120"))
+REQUEST_DELAY_S   = float(os.getenv("REQUEST_DELAY_S", "0.4"))
 
-MIN_CANDLE_TRADES    = int(os.getenv("MIN_CANDLE_TRADES",    "3"))     # min history to trust
-MIN_WIN_RATE         = float(os.getenv("MIN_WIN_RATE",       "0.60"))  # 60 %
-MIN_POSITION_USD     = float(os.getenv("MIN_POSITION_USD",   "200"))
-MAX_ENTRY_PRICE      = float(os.getenv("MAX_ENTRY_PRICE",    "0.85"))
-TRADES_PER_MARKET    = int(os.getenv("TRADES_PER_MARKET",    "100"))
-TOP_TRADERS_WATCH    = int(os.getenv("TOP_TRADERS_WATCH",    "20"))    # wallets to follow
+MIN_WIN_RATE      = float(os.getenv("MIN_WIN_RATE",     "0.60"))
+MIN_SCORED_TRADES = int(os.getenv("MIN_SCORED_TRADES",  "3"))
+MIN_TRADE_USD     = float(os.getenv("MIN_TRADE_USD",    "20"))
+TOP_TRADERS_N     = int(os.getenv("TOP_TRADERS_N",      "30"))
+TRADES_PER_MKT    = int(os.getenv("TRADES_PER_MKT",    "100"))
+CLOSED_MKTS_N     = int(os.getenv("CLOSED_MKTS_N",     "50"))
+NOTIFY_THRESHOLD  = int(os.getenv("NOTIFY_THRESHOLD",  "1"))
+MAX_SIGNAL_AGE_S  = int(os.getenv("MAX_SIGNAL_AGE_S",  "120"))
 
-NOTIFY_THRESHOLD     = int(os.getenv("NOTIFY_THRESHOLD",     "1"))     # min traders in same position
-TELEGRAM_TOKEN       = os.getenv("TELEGRAM_TOKEN",  "")
-TELEGRAM_CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN",  "")
+TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 
-AUTOBUY_ENABLED      = os.getenv("AUTOBUY_ENABLED",  "false").lower() == "true"
-AUTOBUY_MIN_TRADERS  = int(os.getenv("AUTOBUY_MIN_TRADERS",  "2"))
-AUTOBUY_MAX_PRICE    = float(os.getenv("AUTOBUY_MAX_PRICE",  "0.70"))
-AUTOBUY_SIZE_USD     = float(os.getenv("AUTOBUY_SIZE_USD",   "10"))
-AUTOBUY_DAILY_LIMIT  = float(os.getenv("AUTOBUY_DAILY_LIMIT","50"))
-POLYMARKET_PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
-POLYMARKET_FUNDER    = os.getenv("POLYMARKET_FUNDER",  "")
-POLYMARKET_SIG_TYPE  = int(os.getenv("POLYMARKET_SIG_TYPE",  "0"))
+AUTOBUY_ENABLED   = os.getenv("AUTOBUY_ENABLED",  "false").lower() == "true"
+AUTOBUY_MIN_TOP   = int(os.getenv("AUTOBUY_MIN_TOP",   "2"))
+AUTOBUY_MAX_PRICE = float(os.getenv("AUTOBUY_MAX_PRICE","0.70"))
+AUTOBUY_SIZE_USD  = float(os.getenv("AUTOBUY_SIZE_USD", "10"))
+AUTOBUY_DAILY_MAX = float(os.getenv("AUTOBUY_DAILY_MAX","50"))
+PRIVATE_KEY       = os.getenv("POLYMARKET_PRIVATE_KEY", "")
+FUNDER            = os.getenv("POLYMARKET_FUNDER", "")
+SIG_TYPE          = int(os.getenv("POLYMARKET_SIG_TYPE", "0"))
+PORT              = int(os.getenv("PORT", "8080"))
 
-PORT = int(os.getenv("PORT", "8080"))
+# ── Confirmed series slugs (verified live) ────────────────────────────────────
+CANDLE_SERIES = [
+    {"slug": "btc-up-or-down-5m",  "asset": "BTC", "window": 5},
+    {"slug": "btc-up-or-down-15m", "asset": "BTC", "window": 15},
+    {"slug": "eth-up-or-down-5m",  "asset": "ETH", "window": 5},
+    {"slug": "eth-up-or-down-15m", "asset": "ETH", "window": 15},
+]
 
-# ─── Persistence helpers ─────────────────────────────────────────────────────
-TRIGGERED_FILE   = "triggered.json"
-BOUGHT_FILE      = "bought.json"
-SETTINGS_FILE    = "settings.json"
-LEDGER_FILE      = "trader_ledger.json"   # candle win/loss history per wallet
+# ── Persistence ───────────────────────────────────────────────────────────────
+F_LEDGER    = "ledger.json"
+F_TRIGGERED = "triggered.json"
+F_BOUGHT    = "bought.json"
+F_SETTINGS  = "settings.json"
 
 def _load(path, default):
     try:
-        with open(path) as f:
-            return json.load(f)
-    except Exception:
-        return default
+        with open(path) as f: return json.load(f)
+    except Exception: return default
 
 def _save(path, data):
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
+    try:
+        with open(path, "w") as f: json.dump(data, f, indent=2)
+    except Exception as e: log.warning(f"Save failed {path}: {e}")
 
-# ─── Shared State ────────────────────────────────────────────────────────────
+# ── Shared state ──────────────────────────────────────────────────────────────
+_lock = threading.Lock()
 state = {
-    "active_markets":  {},   # conditionId → market_info
-    "trader_ledger":   {},   # wallet → {wins, losses, volume_usd, last_seen}
-    "top_traders":     [],   # ranked list of wallets
-    "live_positions":  {},   # wallet → {conditionId → {outcome, size, price}}
-    "signals":         {},   # conditionId → {YES/NO: [wallet, ...]}
-    "triggered":       _load(TRIGGERED_FILE, {}),
-    "bought":          _load(BOUGHT_FILE, {"markets": {}, "spent_today": 0.0}),
-    "settings":        _load(SETTINGS_FILE, {}),
+    "open_markets": {},    # conditionId -> market info dict
+    "ledger":       {},    # proxyWallet -> {wins, losses, vol_usd}
+    "top_traders":  set(), # qualifying proxyWallet addresses
+    "scored_cids":  set(), # conditionIds already scored (avoid double-count)
+    "signals":      [],    # current signal list
+    "triggered":    _load(F_TRIGGERED, {}),
+    "bought":       _load(F_BOUGHT, {"markets": {}, "spent": 0.0, "day": ""}),
+    "settings":     _load(F_SETTINGS, {}),
     "stats": {
-        "markets_tracked": 0,
-        "traders_scored":  0,
-        "signals_today":   0,
-        "last_scan":       None,
+        "open_markets": 0, "ledger_size": 0, "top_traders": 0,
+        "signals_today": 0, "last_scan": None, "last_ledger": None,
     },
 }
-state_lock = threading.Lock()
 
-# ─── Candle Market Detection ──────────────────────────────────────────────────
-# Confirmed series slugs for BTC/ETH 5min and 15min candle markets
-CANDLE_SERIES = [
-    {"slug": "btc-up-or-down-5m",  "asset": "BTC", "window_min": 5},
-    {"slug": "btc-up-or-down-15m", "asset": "BTC", "window_min": 15},
-    {"slug": "eth-up-or-down-5m",  "asset": "ETH", "window_min": 5},
-    {"slug": "eth-up-or-down-15m", "asset": "ETH", "window_min": 15},
-]
+# ── HTTP ──────────────────────────────────────────────────────────────────────
+_sess = requests.Session()
+_sess.headers["User-Agent"] = "PMB/3.0"
 
-_CANDLE_KEYWORDS = re.compile(
-    r"(5.?min|15.?min|5-minute|15-minute)", re.IGNORECASE
-)
-_TIME_RANGE = re.compile(
-    r"\d{1,2}:\d{2}\s*(AM|PM)\s*[-–]\s*\d{1,2}:\d{2}\s*(AM|PM)", re.IGNORECASE
-)
-_HOUR_SLOT  = re.compile(
-    r"\d{1,2}\s*(AM|PM)\s*(ET|EST|EDT)", re.IGNORECASE
-)
-_UPDOWN     = re.compile(r"up or down", re.IGNORECASE)
-_BTC        = re.compile(r"bitcoin|btc", re.IGNORECASE)
-_ETH        = re.compile(r"ethereum|eth\b", re.IGNORECASE)
-
-def _is_candle_market(title: str) -> bool:
-    """Return True for BTC/ETH 5min or 15min candle markets."""
-    if not (_BTC.search(title) or _ETH.search(title)):
-        return False
-    if _CANDLE_KEYWORDS.search(title):
-        return True
-    if _UPDOWN.search(title):
-        # "Bitcoin Up or Down - May 8, 1:30PM-1:35PM ET"  → 5-min window
-        if _TIME_RANGE.search(title):
-            return True
-        # "Bitcoin Up or Down - May 8, 1PM ET" → hourly (skip)
-        if _HOUR_SLOT.search(title) and not _TIME_RANGE.search(title):
-            return False
-    return False
-
-def _candle_window(title: str) -> int:
-    """Return 5 or 15 based on title; default 5."""
-    if re.search(r"15.?min|15-minute", title, re.IGNORECASE):
-        return 15
-    return 5
-
-# ─── API helpers ──────────────────────────────────────────────────────────────
-_session = requests.Session()
-_session.headers.update({"User-Agent": "PMB/2.0"})
-
-def _get(url, params=None, retries=3):
-    for attempt in range(retries):
+def _get(url, params=None):
+    for attempt in range(3):
         try:
-            r = _session.get(url, params=params, timeout=10)
+            r = _sess.get(url, params=params, timeout=12)
             r.raise_for_status()
             return r.json()
         except Exception as e:
-            if attempt == retries - 1:
-                log.warning(f"GET failed {url}: {e}")
+            if attempt == 2:
+                log.warning(f"GET failed {url} {params}: {e}")
                 return None
-            time.sleep(1)
+            time.sleep(1.5)
 
-def _telegram(msg: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+def _tg(msg: str, chat_id: str = None):
+    if not TELEGRAM_TOKEN: return
+    cid = chat_id or TELEGRAM_CHAT_ID
+    if not cid: return
     try:
-        _session.post(
+        _sess.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+            json={"chat_id": cid, "text": msg, "parse_mode": "HTML"},
             timeout=10,
         )
-    except Exception as e:
-        log.warning(f"Telegram error: {e}")
+    except Exception as e: log.warning(f"Telegram error: {e}")
 
-# ─── Step 1: Discover Active Candle Markets ───────────────────────────────────
-def discover_candle_markets() -> dict:
-    """
-    Fetch open BTC/ETH 5min & 15min markets using confirmed seriesSlug filter.
-
-    Confirmed working endpoint (verified against live API):
-      GET https://gamma-api.polymarket.com/events
-          ?seriesSlug=btc-up-or-down-5m&closed=false&limit=20&order=id&ascending=false
-
-    Each event has a nested markets[] array. markets[0] contains:
-      - conditionId  → used for trades/positions lookups on data-api
-      - clobTokenIds → JSON string of [up_token_id, down_token_id]
-      - outcomes     → JSON string ["Up", "Down"]
-    """
+# ── Step 1: Open markets ──────────────────────────────────────────────────────
+def discover_open_markets() -> dict:
     found = {}
-
-    for series in CANDLE_SERIES:
+    for s in CANDLE_SERIES:
         data = _get(f"{GAMMA_API}/events", params={
-            "seriesSlug": series["slug"],
-            "closed":     "false",
-            "order":      "id",
-            "ascending":  "false",
-            "limit":      10,   # only need the current/next candle(s)
+            "seriesSlug": s["slug"], "closed": "false",
+            "order": "id", "ascending": "false", "limit": 5,
         })
-        if not data:
-            time.sleep(REQUEST_DELAY_S)
-            continue
-
-        events = data if isinstance(data, list) else data.get("data", [])
-        for event in events:
-            markets = event.get("markets", [])
-            if not markets:
-                continue
-            m = markets[0]   # each candle event has exactly one market
-            cid = m.get("conditionId")
-            if not cid:
-                continue
-
-            raw_outcomes  = m.get("outcomes", '["Up","Down"]')
-            raw_token_ids = m.get("clobTokenIds", "[]")
-            if isinstance(raw_outcomes, str):
-                try:    raw_outcomes  = json.loads(raw_outcomes)
-                except: raw_outcomes  = ["Up", "Down"]
-            if isinstance(raw_token_ids, str):
-                try:    raw_token_ids = json.loads(raw_token_ids)
-                except: raw_token_ids = []
-
-            found[cid] = {
-                "conditionId": cid,
-                "title":       event.get("title") or m.get("question", ""),
-                "asset":       series["asset"],
-                "window_min":  series["window_min"],
-                "outcomes":    raw_outcomes,   # ["Up", "Down"]
-                "token_ids":   raw_token_ids,
-                "end_date":    m.get("endDate"),
-                "series_slug": series["slug"],
-            }
-
         time.sleep(REQUEST_DELAY_S)
-
-    log.info(f"Discovered {len(found)} active candle markets "
-             f"({', '.join(s['slug'] for s in CANDLE_SERIES)})")
+        if not data: continue
+        for ev in (data if isinstance(data, list) else []):
+            for m in ev.get("markets", []):
+                cid = m.get("conditionId")
+                if not cid: continue
+                try:
+                    outcomes  = json.loads(m.get("outcomes",  '["Up","Down"]'))
+                    token_ids = json.loads(m.get("clobTokenIds", "[]"))
+                except Exception:
+                    outcomes, token_ids = ["Up","Down"], []
+                found[cid] = {
+                    "conditionId": cid,
+                    "title":    ev.get("title", m.get("question","")),
+                    "asset":    s["asset"],  "window":   s["window"],
+                    "outcomes": outcomes,    "token_ids": token_ids,
+                    "end_date": m.get("endDate",""),
+                }
+    log.info(f"Open markets: {len(found)}")
     return found
 
-# ─── Step 2: Pull Recent Trades Per Market ────────────────────────────────────
-def fetch_market_trades(condition_id: str) -> list:
-    data = _get(f"{DATA_API}/trades", params={
-        "conditionId": condition_id,
-        "limit":       TRADES_PER_MARKET,
-    })
-    if not data:
-        return []
-    return data if isinstance(data, list) else data.get("data", [])
-
-
-def fetch_recent_closed_markets(series_slug: str, limit: int = 30) -> list:
-    """Fetch recently resolved candle markets for a given series."""
-    data = _get(f"{GAMMA_API}/events", params={
-        "seriesSlug": series_slug,
-        "closed":     "true",
-        "order":      "id",
-        "ascending":  "false",
-        "limit":      limit,
-    })
-    if not data:
-        return []
-    return data if isinstance(data, list) else data.get("data", [])
-
-
-def _resolved_outcome(market: dict) -> str | None:
-    """
-    Extract the winning outcome from a resolved market.
-    Polymarket sets the winning token price to 1.0 on resolution.
-    e.g. outcomes=["Up","Down"], outcomePrices=["1","0"] -> "Up" won.
-    """
-    raw_outcomes = market.get("outcomes", '["Up","Down"]')
-    raw_prices   = market.get("outcomePrices", '["0.5","0.5"]')
+# ── Step 2: Ledger from closed markets ────────────────────────────────────────
+def _resolved_outcome(market: dict):
     try:
-        if isinstance(raw_outcomes, str):
-            raw_outcomes = json.loads(raw_outcomes)
-        if isinstance(raw_prices, str):
-            raw_prices = json.loads(raw_prices)
-        prices  = [float(p) for p in raw_prices]
-        max_idx = prices.index(max(prices))
-        if max(prices) >= 0.99:   # confirmed resolved, not just 50/50
-            return raw_outcomes[max_idx]
-    except Exception:
-        pass
+        outcomes = json.loads(market["outcomes"]) if isinstance(market.get("outcomes"), str) else market.get("outcomes", ["Up","Down"])
+        prices   = json.loads(market["outcomePrices"]) if isinstance(market.get("outcomePrices"), str) else market.get("outcomePrices", [])
+        if not prices: return None
+        pf = [float(p) for p in prices]
+        mx = max(pf)
+        if mx >= 0.99:
+            return outcomes[pf.index(mx)]
+    except Exception: pass
     return None
 
+def rebuild_ledger():
+    ledger  = state["ledger"]
+    scored  = state["scored_cids"]
+    new_n   = 0
 
-# ─── Step 3: Score Traders on Candle Markets ──────────────────────────────────
-def update_trader_ledger(_open_markets: dict):
-    """
-    Build win/loss history by processing recently CLOSED candle markets.
-    For each closed market:
-      1. Determine resolved outcome from outcomePrices (price ~1.0 = winner)
-      2. Fetch all trades for that market from data-api
-      3. Credit each wallet a win or loss based on which side they bought
-    """
-    ledger  = state["trader_ledger"]
-    scored  = state.get("_scored_markets", set())
-
-    for series in CANDLE_SERIES:
-        closed_events = fetch_recent_closed_markets(series["slug"], limit=30)
+    for s in CANDLE_SERIES:
+        data = _get(f"{GAMMA_API}/events", params={
+            "seriesSlug": s["slug"], "closed": "true",
+            "order": "id", "ascending": "false", "limit": CLOSED_MKTS_N,
+        })
         time.sleep(REQUEST_DELAY_S)
+        if not data: continue
 
-        for event in closed_events:
-            markets = event.get("markets", [])
-            if not markets:
-                continue
-            m   = markets[0]
-            cid = m.get("conditionId")
-            if not cid or cid in scored:
-                continue   # already processed
+        for ev in (data if isinstance(data, list) else []):
+            for m in ev.get("markets", []):
+                cid = m.get("conditionId")
+                if not cid or cid in scored: continue
 
-            resolved = _resolved_outcome(m)
-            if not resolved:
-                continue   # not yet resolved (still 0.5/0.5)
-
-            trades = fetch_market_trades(cid)
-            time.sleep(REQUEST_DELAY_S)
-
-            for t in trades:
-                # Confirmed field names from data-api.polymarket.com/trades docs:
-                # proxyWallet, side ("BUY"/"SELL"), outcome, size, price
-                wallet     = t.get("proxyWallet")
-                t_outcome  = (t.get("outcome") or "").capitalize()  # "Up" / "Down"
-                side       = (t.get("side") or "").upper()          # "BUY" / "SELL"
-                size       = float(t.get("size")  or 0)
-                price      = float(t.get("price") or 0)
-                usd_val    = size * price
-
-                # Only count BUY trades (opening a position), skip dust
-                if side == "SELL" or usd_val < 1 or not wallet:
+                winner = _resolved_outcome(m)
+                if not winner:
+                    scored.add(cid)   # mark so we don't keep retrying unresolved
                     continue
 
-                if wallet not in ledger:
-                    ledger[wallet] = {
-                        "wins": 0, "losses": 0,
-                        "volume_usd": 0.0,
-                        "last_seen": None,
-                    }
+                trades = _get(f"{DATA_API}/trades", params={"conditionId": cid, "limit": TRADES_PER_MKT})
+                time.sleep(REQUEST_DELAY_S)
+                trade_list = (trades if isinstance(trades, list) else (trades or {}).get("data", [])) if trades else []
 
-                entry = ledger[wallet]
-                entry["volume_usd"] += usd_val
-                entry["last_seen"]   = datetime.now(timezone.utc).isoformat()
+                for t in trade_list:
+                    wallet  = t.get("proxyWallet")
+                    side    = (t.get("side") or "").upper()
+                    outcome = (t.get("outcome") or "").strip()
+                    usd     = float(t.get("size") or 0) * float(t.get("price") or 0)
+                    if not wallet or side != "BUY" or usd < MIN_TRADE_USD: continue
+                    if wallet not in ledger:
+                        ledger[wallet] = {"wins": 0, "losses": 0, "vol_usd": 0.0}
+                    ledger[wallet]["vol_usd"] += usd
+                    if outcome == winner: ledger[wallet]["wins"]   += 1
+                    else:                 ledger[wallet]["losses"] += 1
 
-                if t_outcome:
-                    if t_outcome == resolved:
-                        entry["wins"]   += 1
-                    else:
-                        entry["losses"] += 1
+                scored.add(cid)
+                new_n += 1
 
-            scored.add(cid)
-
-    state["_scored_markets"] = scored
-    # Persist scored market IDs inside the ledger file under a reserved key
-    ledger["_scored"] = list(scored)
-    _save(LEDGER_FILE, ledger)
-    ledger.pop("_scored", None)   # remove from in-memory ledger so rank_traders ignores it
-    log.info(f"Ledger updated: {len(ledger)} traders tracked, {len(scored)} markets scored")
-
-def rank_traders() -> list:
-    """
-    Return wallets sorted by win-rate, filtered by minimum trade count.
-    Wallets with no resolved trades yet are ranked by volume (potential).
-    """
-    ledger = state["trader_ledger"]
-    scored = []
-    for wallet, e in ledger.items():
+    # Recompute top traders
+    top = set()
+    for w, e in ledger.items():
         total = e["wins"] + e["losses"]
-        win_rate = (e["wins"] / total) if total > 0 else None
-        if total > 0 and total < MIN_CANDLE_TRADES:
-            continue   # not enough history
-        scored.append({
-            "wallet":    wallet,
-            "win_rate":  win_rate,
-            "wins":      e["wins"],
-            "losses":    e["losses"],
-            "total":     total,
-            "volume_usd": e["volume_usd"],
-            "last_seen": e.get("last_seen"),
-        })
+        if total >= MIN_SCORED_TRADES and (e["wins"] / total) >= MIN_WIN_RATE:
+            top.add(w)
+    state["top_traders"] = top
 
-    # Sort: wallets with resolved history first (by win_rate), then by volume
-    def _sort_key(x):
-        if x["win_rate"] is not None:
-            return (1, x["win_rate"], x["volume_usd"])
-        return (0, 0, x["volume_usd"])
+    _save(F_LEDGER, {"ledger": ledger, "scored": list(scored)})
+    state["stats"].update({"ledger_size": len(ledger), "top_traders": len(top),
+                           "last_ledger": datetime.now(timezone.utc).isoformat()})
+    log.info(f"Ledger: {len(ledger)} wallets, {len(scored)} scored (+{new_n}), {len(top)} top traders")
 
-    ranked = sorted(scored, key=_sort_key, reverse=True)
-    qualified = [r for r in ranked if r["win_rate"] is None or r["win_rate"] >= MIN_WIN_RATE]
-    log.info(f"Ranked {len(ranked)} traders; {len(qualified)} qualified (≥{MIN_WIN_RATE:.0%} win rate)")
-    return qualified[:TOP_TRADERS_WATCH]
-
-# ─── Step 4: Watch Live Positions of Top Traders ─────────────────────────────
-def fetch_wallet_positions(wallet: str) -> dict:
-    data = _get(f"{DATA_API}/positions", params={"user": wallet})
-    if not data:
-        return {}
-    positions = data if isinstance(data, list) else data.get("data", [])
-    result = {}
-    for p in positions:
-        # Confirmed field names from data-api positions docs:
-        # conditionId, outcome, size, avgPrice, currentValue
-        cid     = p.get("conditionId")
-        outcome = (p.get("outcome") or "").capitalize()   # "Up" / "Down"
-        size    = float(p.get("size")     or 0)
-        price   = float(p.get("avgPrice") or p.get("curPrice") or 0)
-        usd     = float(p.get("currentValue") or size * price)
-        if cid and usd >= MIN_POSITION_USD:
-            result[cid] = {"outcome": outcome, "size_usd": usd, "price": price}
-    return result
-
-def scan_top_trader_positions():
-    """
-    For each top trader, fetch their open positions.
-    Only flag positions that are in our tracked candle markets.
-    """
+# ── Step 3: Scan trades on open markets ───────────────────────────────────────
+def scan_signals() -> list:
+    open_markets = state["open_markets"]
     top_traders  = state["top_traders"]
-    active_mkts  = state["active_markets"]
-    signals      = defaultdict(lambda: defaultdict(list))   # cid → outcome → [wallets]
+    if not open_markets or not top_traders: return []
 
-    for trader in top_traders:
-        wallet = trader["wallet"]
-        positions = fetch_wallet_positions(wallet)
+    now_ts  = time.time()
+    seen    = {}   # "cid:outcome" -> signal dict
+    signals = []
+
+    for cid, mkt in open_markets.items():
+        trades = _get(f"{DATA_API}/trades", params={"conditionId": cid, "limit": 50})
         time.sleep(REQUEST_DELAY_S)
+        if not trades: continue
+        trade_list = trades if isinstance(trades, list) else trades.get("data", [])
 
-        for cid, pos in positions.items():
-            if cid not in active_mkts:
-                continue   # not a candle market we track
-            outcome = (pos.get("outcome") or "").capitalize()  # "Up" or "Down"
-            price   = pos.get("price", 0)
-            if outcome and price <= MAX_ENTRY_PRICE:
-                signals[cid][outcome].append({
-                    "wallet":    wallet,
-                    "win_rate":  trader.get("win_rate"),
-                    "size_usd":  pos["size_usd"],
-                    "price":     price,
-                })
+        for t in trade_list:
+            wallet    = t.get("proxyWallet")
+            side      = (t.get("side") or "").upper()
+            outcome   = (t.get("outcome") or "").strip()
+            usd       = float(t.get("size") or 0) * float(t.get("price") or 0)
+            price     = float(t.get("price") or 0)
+            timestamp = int(t.get("timestamp") or 0)
 
-    return signals
+            if not wallet or side != "BUY": continue
+            if wallet not in top_traders: continue
+            if usd < MIN_TRADE_USD: continue
+            if now_ts - timestamp > MAX_SIGNAL_AGE_S: continue
 
-# ─── Alerts & Auto-buy ────────────────────────────────────────────────────────
-def today_key():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            key = f"{cid}:{outcome}"
+            if key not in seen:
+                seen[key] = {
+                    "conditionId": cid, "title": mkt["title"],
+                    "asset": mkt["asset"], "window": mkt["window"],
+                    "outcome": outcome, "traders": [],
+                    "end_date": mkt["end_date"], "token_ids": mkt["token_ids"],
+                    "outcomes": mkt["outcomes"],
+                }
+                signals.append(seen[key])
 
-def _already_triggered(cid, outcome):
-    key = f"{cid}:{outcome}:{today_key()}"
-    return key in state["triggered"]
+            e     = state["ledger"].get(wallet, {})
+            total = e.get("wins",0) + e.get("losses",0)
+            seen[key]["traders"].append({
+                "wallet":   wallet, "price": price, "usd": round(usd,2),
+                "win_rate": round(e["wins"]/total,3) if total>0 else None,
+                "ts":       timestamp,
+            })
 
-def _mark_triggered(cid, outcome):
-    key = f"{cid}:{outcome}:{today_key()}"
-    state["triggered"][key] = datetime.now(timezone.utc).isoformat()
-    _save(TRIGGERED_FILE, state["triggered"])
+    return [s for s in signals if len(s["traders"]) >= NOTIFY_THRESHOLD]
 
-def send_signal_alert(cid, outcome, holders, mkt_info):
-    title   = mkt_info.get("title", cid)
-    asset   = mkt_info.get("asset", "")
-    window  = mkt_info.get("window_min", 5)
-    prices  = [h["price"] for h in holders]
-    avg_px  = sum(prices) / len(prices) if prices else 0
-    wr_list = [f"{h['win_rate']:.0%}" if h["win_rate"] else "?" for h in holders]
+# ── Alerts ────────────────────────────────────────────────────────────────────
+def _fire_alerts(signals: list):
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if state["bought"].get("day") != today:
+        state["bought"].update({"spent": 0.0, "day": today, "markets": {}})
+        _save(F_BOUGHT, state["bought"])
 
-    msg = (
-        f"🕯️ <b>PMB Candle Signal</b>\n"
-        f"<b>{asset} {window}min</b> → <b>{outcome}</b>\n"
-        f"📋 {title}\n"
-        f"👥 {len(holders)} top trader(s) holding {outcome}\n"
-        f"💰 Avg price: {avg_px:.2f}\n"
-        f"📊 Win rates: {', '.join(wr_list)}\n"
-        f"🔗 https://polymarket.com/event/{cid}"
-    )
-    _telegram(msg)
-    log.info(f"SIGNAL: {asset} {window}min {outcome} @ {avg_px:.2f} ({len(holders)} traders)")
-    state["stats"]["signals_today"] += 1
+    for sig in signals:
+        key = f"{sig['conditionId']}:{sig['outcome']}"
+        if state["triggered"].get(key,"")[:10] == today: continue
 
-def attempt_autobuy(cid, outcome, holders, mkt_info):
-    if not AUTOBUY_ENABLED:
-        return
-    settings = state["settings"]
-    min_t    = settings.get("autobuy_min_traders", AUTOBUY_MIN_TRADERS)
-    max_px   = settings.get("autobuy_max_price",   AUTOBUY_MAX_PRICE)
-    size     = settings.get("autobuy_size_usd",    AUTOBUY_SIZE_USD)
-    daily    = settings.get("autobuy_daily_limit", AUTOBUY_DAILY_LIMIT)
+        traders = sig["traders"]
+        avg_px  = sum(t["price"] for t in traders) / len(traders)
+        wr_str  = ", ".join(f"{t['win_rate']:.0%}" if t["win_rate"] is not None else "?" for t in traders)
 
-    if len(holders) < min_t:
-        return
-    avg_px = sum(h["price"] for h in holders) / len(holders)
-    if avg_px > max_px:
-        return
-    if state["bought"]["spent_today"] + size > daily:
-        log.info("Daily auto-buy limit reached")
-        return
-    if cid in state["bought"]["markets"]:
-        return   # already bought this market today
+        msg = (
+            f"🕯 <b>PMB Signal</b> — {sig['asset']} {sig['window']}min\n"
+            f"<b>{sig['outcome']}</b> @ {avg_px:.2f}\n"
+            f"📋 {sig['title']}\n"
+            f"👥 {len(traders)} top trader(s) | WR: {wr_str}\n"
+            f"🔗 https://polymarket.com/event/{sig['conditionId']}"
+        )
+        _tg(msg)
+        state["triggered"][key] = datetime.now(timezone.utc).isoformat()
+        _save(F_TRIGGERED, state["triggered"])
+        state["stats"]["signals_today"] += 1
+        log.info(f"SIGNAL {sig['asset']} {sig['window']}min {sig['outcome']} @ {avg_px:.2f} ({len(traders)} traders)")
+        _try_autobuy(sig, avg_px)
 
-    _execute_buy(cid, outcome, mkt_info, size, avg_px)
+def _try_autobuy(sig, avg_px):
+    s = state["settings"]
+    if not s.get("autobuy_enabled", AUTOBUY_ENABLED): return
+    if len(sig["traders"]) < s.get("autobuy_min_top", AUTOBUY_MIN_TOP): return
+    if avg_px > s.get("autobuy_max_price", AUTOBUY_MAX_PRICE): return
+    size = s.get("autobuy_size_usd", AUTOBUY_SIZE_USD)
+    if state["bought"]["spent"] + size > s.get("autobuy_daily_max", AUTOBUY_DAILY_MAX): return
+    if sig["conditionId"] in state["bought"]["markets"]: return
+    _place_order(sig["conditionId"], sig["outcome"], sig["outcomes"], sig["token_ids"], avg_px, size)
 
-def _execute_buy(cid, outcome, mkt_info, size_usd, price):
-    """Place a buy order via py_clob_client_v2."""
-    if not POLYMARKET_PRIVATE_KEY:
-        log.warning("No private key — skipping auto-buy")
-        return
+def _place_order(cid, outcome, outcomes, token_ids, price, size_usd):
+    if not PRIVATE_KEY: log.warning("No PRIVATE_KEY — skipping"); return
     try:
-        from py_clob_client_v2 import ClobClient, ApiCreds, OrderArgs, OrderType, Side
-        l1  = ClobClient(host=CLOB_HOST, chain_id=137, key=POLYMARKET_PRIVATE_KEY)
-        if POLYMARKET_SIG_TYPE == 1 and POLYMARKET_FUNDER:
-            creds = l1.create_or_derive_api_key(nonce=0)
-            client = ClobClient(
-                host=CLOB_HOST, chain_id=137, key=POLYMARKET_PRIVATE_KEY,
-                creds=creds, funder=POLYMARKET_FUNDER, signature_type=1,
-            )
-        else:
-            creds  = l1.create_or_derive_api_key()
-            client = ClobClient(host=CLOB_HOST, chain_id=137, key=POLYMARKET_PRIVATE_KEY, creds=creds)
-
-        token_ids = mkt_info.get("token_ids", [])
-        outcomes  = mkt_info.get("outcomes", ["Up", "Down"])
-        try:
-            token_idx = outcomes.index(outcome)
-            token_id  = token_ids[token_idx]
-        except (ValueError, IndexError):
-            log.warning(f"Cannot resolve token_id for {outcome} in {cid}")
-            return
-
-        size_shares = round(size_usd / price, 4)
+        from py_clob_client_v2 import ClobClient, OrderArgs, OrderType, Side
+        l1    = ClobClient(host=CLOB_HOST, chain_id=137, key=PRIVATE_KEY)
+        creds = l1.create_or_derive_api_key(nonce=0) if SIG_TYPE==1 else l1.create_or_derive_api_key()
+        kw    = {"funder": FUNDER, "signature_type": 1} if SIG_TYPE==1 and FUNDER else {}
+        client = ClobClient(host=CLOB_HOST, chain_id=137, key=PRIVATE_KEY, creds=creds, **kw)
+        token_id = token_ids[outcomes.index(outcome)]
         order = client.create_order(OrderArgs(
-            token_id   = token_id,
-            price      = price,
-            size       = size_shares,
-            side       = Side.BUY,
-            order_type = OrderType.GTC,
+            token_id=token_id, price=price, size=round(size_usd/price,4),
+            side=Side.BUY, order_type=OrderType.GTC,
         ))
         resp = client.post_order(order)
-        log.info(f"Auto-buy placed: {outcome} @ {price} size={size_shares:.4f} → {resp}")
-
-        state["bought"]["markets"][cid] = {
-            "outcome": outcome, "price": price,
-            "size_usd": size_usd, "ts": datetime.now(timezone.utc).isoformat(),
-        }
-        state["bought"]["spent_today"] = round(state["bought"]["spent_today"] + size_usd, 2)
-        _save(BOUGHT_FILE, state["bought"])
-
-        _telegram(
-            f"✅ <b>Auto-buy executed</b>\n"
-            f"{mkt_info.get('asset','')} {mkt_info.get('window_min',5)}min → {outcome}\n"
-            f"Price: {price:.2f} | Size: ${size_usd:.2f}"
-        )
+        log.info(f"Order: {outcome} @ {price} ${size_usd} → {resp}")
+        state["bought"]["markets"][cid] = {"outcome": outcome, "price": price, "usd": size_usd,
+                                            "ts": datetime.now(timezone.utc).isoformat()}
+        state["bought"]["spent"] = round(state["bought"]["spent"] + size_usd, 2)
+        _save(F_BOUGHT, state["bought"])
+        _tg(f"✅ <b>Bought</b> {outcome} @ {price:.2f} (${size_usd})")
     except Exception as e:
-        log.error(f"Auto-buy error: {e}")
-        _telegram(f"⚠️ Auto-buy error: {e}")
+        log.error(f"Order error: {e}"); _tg(f"⚠️ Autobuy error: {e}")
 
-# ─── Main Polling Loop ────────────────────────────────────────────────────────
+# ── Main loop ─────────────────────────────────────────────────────────────────
 def main_loop():
-    last_market_refresh = 0
-    last_trader_refresh = 0
-    last_day            = today_key()
-
+    last_ledger = last_markets = 0
     while True:
+        if state["settings"].get("paused"):
+            time.sleep(POLL_INTERVAL_S); continue
         now = time.time()
 
-        # Reset daily counters at midnight UTC
-        current_day = today_key()
-        if current_day != last_day:
-            state["bought"]["spent_today"] = 0.0
-            state["stats"]["signals_today"] = 0
-            _save(BOUGHT_FILE, state["bought"])
-            log.info("Daily counters reset")
-            last_day = current_day
+        if now - last_ledger > LEDGER_REFRESH_S:
+            try: rebuild_ledger()
+            except Exception as e: log.error(f"Ledger error: {e}")
+            last_ledger = time.time()
 
-        # Honour /pause command
-        if state["settings"].get("paused"):
-            time.sleep(POLL_INTERVAL_S)
-            continue
+        if now - last_markets > MARKET_REFRESH_S:
+            try:
+                mkts = discover_open_markets()
+                with _lock:
+                    state["open_markets"] = mkts
+                    state["stats"]["open_markets"] = len(mkts)
+            except Exception as e: log.error(f"Market error: {e}")
+            last_markets = time.time()
 
-        # Refresh candle market list
-        if now - last_market_refresh > MARKET_REFRESH_S:
-            with state_lock:
-                state["active_markets"] = discover_candle_markets()
-                state["stats"]["markets_tracked"] = len(state["active_markets"])
-            last_market_refresh = now
-
-        # Update trader ledger & re-rank (uses closed markets, not open ones)
-        if now - last_trader_refresh > TRADER_REFRESH_S:
-            with state_lock:
-                update_trader_ledger(state["active_markets"])
-                state["top_traders"] = rank_traders()
-                state["stats"]["traders_scored"] = len(state["top_traders"])
-            last_trader_refresh = now
-
-        # Scan live positions of top traders in active candle markets
-        signals = scan_top_trader_positions()
-
-        with state_lock:
-            state["signals"] = {k: dict(v) for k, v in signals.items()}
-
-        # Fire alerts and auto-buy
-        for cid, outcomes in signals.items():
-            mkt_info = state["active_markets"].get(cid, {})
-            for outcome, holders in outcomes.items():
-                if len(holders) < NOTIFY_THRESHOLD:
-                    continue
-                if _already_triggered(cid, outcome):
-                    continue
-                send_signal_alert(cid, outcome, holders, mkt_info)
-                _mark_triggered(cid, outcome)
-                attempt_autobuy(cid, outcome, holders, mkt_info)
+        try:
+            sigs = scan_signals()
+            with _lock: state["signals"] = sigs
+            _fire_alerts(sigs)
+        except Exception as e: log.error(f"Scan error: {e}")
 
         state["stats"]["last_scan"] = datetime.now(timezone.utc).isoformat()
         log.info(
-            f"Scan done | markets={state['stats']['markets_tracked']} "
-            f"traders={state['stats']['traders_scored']} "
-            f"signals={len(signals)}"
+            f"Scan | open={state['stats']['open_markets']} "
+            f"ledger={state['stats']['ledger_size']} "
+            f"top={state['stats']['top_traders']} "
+            f"signals={len(state['signals'])}"
         )
         time.sleep(POLL_INTERVAL_S)
 
-# ─── Telegram Webhook ────────────────────────────────────────────────────────
-def register_telegram_webhook():
-    """Tell Telegram to POST updates to our Railway URL instead of long-polling."""
-    domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
-    if not domain or not TELEGRAM_TOKEN:
-        log.warning("Telegram webhook not registered: missing RAILWAY_PUBLIC_DOMAIN or TOKEN")
-        return
-    url = f"https://{domain}/telegram"
-    try:
-        r = _session.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook",
-            json={"url": url},
-            timeout=10,
-        )
-        result = r.json()
-        if result.get("ok"):
-            log.info(f"Telegram webhook registered: {url}")
-        else:
-            log.warning(f"Telegram webhook failed: {result}")
-    except Exception as e:
-        log.warning(f"Telegram webhook error: {e}")
-
-# Keep long-poll fallback for local dev (no RAILWAY_PUBLIC_DOMAIN set)
-def telegram_bot_loop():
-    offset = None
-    while True:
-        try:
-            params = {"timeout": 30}
-            if offset:
-                params["offset"] = offset
-            r = _session.get(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-                params=params, timeout=35,
-            )
-            updates = r.json().get("result", [])
-            for u in updates:
-                offset = u["update_id"] + 1
-                msg    = u.get("message", {})
-                text   = msg.get("text", "").strip()
-                chat   = str(msg.get("chat", {}).get("id", ""))
-                if chat != TELEGRAM_CHAT_ID:
-                    continue
-                _handle_command(text)
-        except Exception as e:
-            log.warning(f"Telegram poll error: {e}")
-        time.sleep(1)
-
-def _handle_command(text: str):
-    s = state["settings"]
-    parts = text.split()
+# ── Telegram commands ─────────────────────────────────────────────────────────
+def _handle_command(text: str, chat_id: str):
+    parts = text.strip().split()
     cmd   = parts[0].lower() if parts else ""
+    s     = state["settings"]
 
-    def reply(msg):
-        _telegram(msg)
+    def reply(msg): _tg(msg, chat_id)
 
     if cmd == "/status":
         st = state["stats"]
         reply(
             f"📊 <b>PMB Status</b>\n"
-            f"Markets tracked: {st['markets_tracked']}\n"
-            f"Traders scored:  {st['traders_scored']}\n"
-            f"Signals today:   {st['signals_today']}\n"
-            f"Spent today:     ${state['bought']['spent_today']:.2f}\n"
-            f"Autobuy:         {'ON' if s.get('autobuy_enabled', AUTOBUY_ENABLED) else 'OFF'}\n"
-            f"Last scan:       {st['last_scan']}"
+            f"Open markets:  {st['open_markets']}\n"
+            f"Ledger:        {st['ledger_size']} wallets\n"
+            f"Top traders:   {st['top_traders']}\n"
+            f"Signals today: {st['signals_today']}\n"
+            f"Spent today:   ${state['bought'].get('spent',0):.2f}\n"
+            f"Autobuy:       {'ON' if s.get('autobuy_enabled', AUTOBUY_ENABLED) else 'OFF'}\n"
+            f"Last scan:     {st['last_scan']}\n"
+            f"Last ledger:   {st['last_ledger']}"
         )
-    elif cmd == "/autobuy":
-        val = parts[1].lower() if len(parts) > 1 else ""
-        s["autobuy_enabled"] = (val == "on")
-        _save(SETTINGS_FILE, s); reply(f"Autobuy {'ON' if s['autobuy_enabled'] else 'OFF'}")
-
-    elif cmd == "/setsize" and len(parts) > 1:
-        s["autobuy_size_usd"] = float(parts[1])
-        _save(SETTINGS_FILE, s); reply(f"Trade size set to ${s['autobuy_size_usd']}")
-
-    elif cmd == "/setdailylimit" and len(parts) > 1:
-        s["autobuy_daily_limit"] = float(parts[1])
-        _save(SETTINGS_FILE, s); reply(f"Daily limit set to ${s['autobuy_daily_limit']}")
-
-    elif cmd == "/setmaxprice" and len(parts) > 1:
-        s["autobuy_max_price"] = float(parts[1]) / 100 if float(parts[1]) > 1 else float(parts[1])
-        _save(SETTINGS_FILE, s); reply(f"Max price set to {s['autobuy_max_price']:.2f}")
-
-    elif cmd == "/setmintraders" and len(parts) > 1:
-        s["autobuy_min_traders"] = int(parts[1])
-        _save(SETTINGS_FILE, s); reply(f"Min traders to copy set to {s['autobuy_min_traders']}")
-
-    elif cmd == "/setwinrate" and len(parts) > 1:
-        s["min_win_rate"] = float(parts[1]) / 100 if float(parts[1]) > 1 else float(parts[1])
-        _save(SETTINGS_FILE, s); reply(f"Min win rate set to {s['min_win_rate']:.0%}")
-
     elif cmd == "/toptraders":
-        top = state["top_traders"][:10]
-        if not top:
-            reply("No traders ranked yet."); return
+        ledger = state["ledger"]
+        rows = sorted(
+            [(w, e) for w, e in ledger.items() if w in state["top_traders"]],
+            key=lambda x: x[1]["wins"]/(x[1]["wins"]+x[1]["losses"]) if (x[1]["wins"]+x[1]["losses"])>0 else 0,
+            reverse=True
+        )[:10]
+        if not rows: reply("No top traders yet."); return
         lines = ["👑 <b>Top Candle Traders</b>"]
-        for i, t in enumerate(top, 1):
-            wr = f"{t['win_rate']:.0%}" if t["win_rate"] else "?"
-            lines.append(f"{i}. {t['wallet'][:8]}… WR={wr} ({t['wins']}W/{t['losses']}L) ${t['volume_usd']:.0f}")
+        for i,(w,e) in enumerate(rows,1):
+            total = e["wins"]+e["losses"]
+            wr = e["wins"]/total if total>0 else 0
+            lines.append(f"{i}. <code>{w[:10]}…</code> {wr:.0%} ({e['wins']}W/{e['losses']}L) ${e['vol_usd']:.0f}")
         reply("\n".join(lines))
-
     elif cmd == "/markets":
-        mkts = list(state["active_markets"].values())[:10]
-        if not mkts:
-            reply("No candle markets found yet."); return
-        lines = ["🕯️ <b>Active Candle Markets</b>"]
-        for m in mkts:
-            lines.append(f"• {m['asset']} {m['window_min']}min — {m['title'][:60]}")
+        mkts = list(state["open_markets"].values())
+        if not mkts: reply("No open markets."); return
+        lines = ["🕯 <b>Open Candle Markets</b>"]
+        for m in mkts[:12]:
+            lines.append(f"• {m['asset']} {m['window']}min — {m['title'][-45:]}")
         reply("\n".join(lines))
-
     elif cmd == "/signals":
         sigs = state["signals"]
-        if not sigs:
-            reply("No active signals."); return
-        lines = ["🚨 <b>Current Signals</b>"]
-        for cid, outcomes in list(sigs.items())[:5]:
-            mkt = state["active_markets"].get(cid, {})
-            for outcome, holders in outcomes.items():
-                lines.append(f"• {mkt.get('asset','')} {mkt.get('window_min','')}min → {outcome} ({len(holders)} traders)")
+        if not sigs: reply("No live signals right now."); return
+        lines = ["🚨 <b>Live Signals</b>"]
+        for sig in sigs[:5]:
+            avg = sum(t["price"] for t in sig["traders"])/len(sig["traders"])
+            lines.append(f"• {sig['asset']} {sig['window']}min → <b>{sig['outcome']}</b> @ {avg:.2f} ({len(sig['traders'])} traders)")
         reply("\n".join(lines))
-
+    elif cmd == "/ledger":
+        reply(f"📒 Wallets: {len(state['ledger'])} | Top: {len(state['top_traders'])} | Scored markets: {len(state['scored_cids'])}")
+    elif cmd == "/autobuy":
+        val = parts[1].lower() if len(parts)>1 else ""
+        s["autobuy_enabled"] = (val=="on")
+        _save(F_SETTINGS,s); reply(f"Autobuy {'✅ ON' if s['autobuy_enabled'] else '❌ OFF'}")
+    elif cmd == "/setsize" and len(parts)>1:
+        s["autobuy_size_usd"]=float(parts[1]); _save(F_SETTINGS,s); reply(f"Size → ${s['autobuy_size_usd']}")
+    elif cmd == "/setdailylimit" and len(parts)>1:
+        s["autobuy_daily_max"]=float(parts[1]); _save(F_SETTINGS,s); reply(f"Daily limit → ${s['autobuy_daily_max']}")
+    elif cmd == "/setmaxprice" and len(parts)>1:
+        v=float(parts[1]); s["autobuy_max_price"]=v/100 if v>1 else v
+        _save(F_SETTINGS,s); reply(f"Max price → {s['autobuy_max_price']:.2f}")
+    elif cmd == "/setmintraders" and len(parts)>1:
+        s["autobuy_min_top"]=int(parts[1]); _save(F_SETTINGS,s); reply(f"Min traders → {s['autobuy_min_top']}")
+    elif cmd == "/setwinrate" and len(parts)>1:
+        v=float(parts[1]); s["min_win_rate"]=v/100 if v>1 else v
+        _save(F_SETTINGS,s); reply(f"Min win rate → {s['min_win_rate']:.0%}")
     elif cmd == "/pause":
-        s["paused"] = True;  _save(SETTINGS_FILE, s); reply("⏸ Scanning paused")
+        s["paused"]=True;  _save(F_SETTINGS,s); reply("⏸ Paused")
     elif cmd == "/resume":
-        s["paused"] = False; _save(SETTINGS_FILE, s); reply("▶️ Scanning resumed")
-
+        s["paused"]=False; _save(F_SETTINGS,s); reply("▶️ Resumed")
     elif cmd == "/help":
         reply(
-            "📖 <b>PMB Commands</b>\n"
-            "/status — stats overview\n"
-            "/toptraders — ranked candle traders\n"
-            "/markets — active BTC/ETH candle markets\n"
-            "/signals — current live signals\n"
-            "/autobuy on|off — toggle auto-buy\n"
-            "/setsize 10 — $ per trade\n"
-            "/setdailylimit 50 — max daily spend\n"
-            "/setmaxprice 70 — max entry (cents)\n"
-            "/setmintraders 2 — min traders to trigger buy\n"
-            "/setwinrate 60 — min win rate % to follow trader\n"
+            "📖 <b>PMB Commands</b>\n\n"
+            "/status — overview\n/toptraders — ranked wallets\n"
+            "/markets — open candle markets\n/signals — live signals\n/ledger — ledger stats\n\n"
+            "/autobuy on|off\n/setsize [usd]\n/setdailylimit [usd]\n"
+            "/setmaxprice [0-100]\n/setmintraders [n]\n/setwinrate [0-100]\n"
             "/pause | /resume"
         )
+    else:
+        reply("Unknown command — try /help")
 
-# ─── Flask API ────────────────────────────────────────────────────────────────
+# ── Flask ─────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
 @app.route("/")
-def health():
-    return jsonify({"status": "ok", "stats": state["stats"]})
+def r_health(): return jsonify({"status":"ok","stats":state["stats"]})
 
 @app.route("/signals")
-def api_signals():
-    out = []
-    for cid, outcomes in state["signals"].items():
-        mkt = state["active_markets"].get(cid, {})
-        for outcome, holders in outcomes.items():
-            out.append({
-                "conditionId": cid,
-                "title":       mkt.get("title"),
-                "asset":       mkt.get("asset"),
-                "window_min":  mkt.get("window_min"),
-                "outcome":     outcome,
-                "holder_count": len(holders),
-                "holders":     holders,
-                "avg_price":   round(sum(h["price"] for h in holders) / len(holders), 3) if holders else 0,
-            })
-    out.sort(key=lambda x: x["holder_count"], reverse=True)
+def r_signals():
+    out=[]
+    for sig in state["signals"]:
+        traders=sig["traders"]
+        avg=sum(t["price"] for t in traders)/max(len(traders),1)
+        out.append({"conditionId":sig["conditionId"],"title":sig["title"],"asset":sig["asset"],
+                    "window":sig["window"],"outcome":sig["outcome"],"trader_count":len(traders),
+                    "avg_price":round(avg,3),"traders":traders})
     return jsonify(out)
 
 @app.route("/markets")
-def api_markets():
-    return jsonify(list(state["active_markets"].values()))
+def r_markets(): return jsonify(list(state["open_markets"].values()))
 
 @app.route("/traders")
-def api_traders():
-    return jsonify(state["top_traders"])
+def r_traders():
+    ledger=state["ledger"]; top=state["top_traders"]
+    rows=[]
+    for w in top:
+        e=ledger.get(w,{}); total=e.get("wins",0)+e.get("losses",0)
+        rows.append({"wallet":w,"wins":e.get("wins",0),"losses":e.get("losses",0),
+                     "win_rate":round(e["wins"]/total,3) if total>0 else None,
+                     "vol_usd":round(e.get("vol_usd",0),2)})
+    rows.sort(key=lambda x:x["win_rate"] or 0,reverse=True)
+    return jsonify(rows)
 
 @app.route("/stats")
-def api_stats():
-    return jsonify({
-        **state["stats"],
-        "spent_today": state["bought"]["spent_today"],
-        "top_trader_count": len(state["top_traders"]),
-    })
+def r_stats(): return jsonify({**state["stats"],"spent_today":state["bought"].get("spent",0)})
 
 @app.route("/telegram", methods=["POST"])
-def telegram_webhook():
-    """Receive Telegram updates via webhook (used on Railway)."""
+def r_telegram():
     try:
-        from flask import request as flask_request
-        update = flask_request.get_json(force=True, silent=True) or {}
-        msg    = update.get("message", {})
-        text   = msg.get("text", "").strip()
-        chat   = str(msg.get("chat", {}).get("id", ""))
-        if text and chat == TELEGRAM_CHAT_ID:
-            _handle_command(text)
-    except Exception as e:
-        log.warning(f"Webhook handler error: {e}")
-    return "", 200   # always 200 so Telegram doesn't retry
+        update  = request.get_json(force=True, silent=True) or {}
+        msg     = update.get("message") or update.get("edited_message") or {}
+        text    = msg.get("text","").strip()
+        chat_id = str(msg.get("chat",{}).get("id",""))
+        if text and chat_id:
+            if not TELEGRAM_CHAT_ID or chat_id == TELEGRAM_CHAT_ID:
+                log.info(f"Telegram: {text!r} from {chat_id}")
+                threading.Thread(target=_handle_command, args=(text,chat_id), daemon=True).start()
+    except Exception as e: log.warning(f"Webhook error: {e}")
+    return "",200
 
-# ─── Entry point ─────────────────────────────────────────────────────────────
+# ── Telegram setup ────────────────────────────────────────────────────────────
+def setup_telegram():
+    domain = os.getenv("RAILWAY_PUBLIC_DOMAIN","")
+    if not TELEGRAM_TOKEN: return
+    if domain:
+        url = f"https://{domain}/telegram"
+        try:
+            r = _sess.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook",
+                json={"url": url, "allowed_updates": ["message"]},
+                timeout=10,
+            )
+            result = r.json()
+            if result.get("ok"):
+                log.info(f"Telegram webhook → {url}")
+                return
+            log.warning(f"Webhook failed: {result}")
+        except Exception as e:
+            log.warning(f"Webhook error: {e}")
+    # Fallback: long-poll (delete any existing webhook first)
+    log.info("Telegram: using long-poll")
+    try:
+        _sess.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook", timeout=10)
+    except Exception: pass
+    threading.Thread(target=_longpoll, daemon=True).start()
+
+def _longpoll():
+    offset = None
+    while True:
+        try:
+            params = {"timeout": 30, "allowed_updates": ["message"]}
+            if offset: params["offset"] = offset
+            r = _sess.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                          params=params, timeout=35)
+            for u in r.json().get("result",[]):
+                offset = u["update_id"]+1
+                msg    = u.get("message",{})
+                text   = msg.get("text","").strip()
+                cid    = str(msg.get("chat",{}).get("id",""))
+                if text and cid:
+                    if not TELEGRAM_CHAT_ID or cid == TELEGRAM_CHAT_ID:
+                        _handle_command(text, cid)
+        except Exception as e: log.warning(f"Long-poll error: {e}")
+        time.sleep(1)
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("PMB Candle Copy Trader starting…")
+    log.info("PMB v3 starting…")
 
-    # Load persisted state
-    state["trader_ledger"] = _load(LEDGER_FILE, {})
-    # Restore set of already-scored market conditionIds to avoid re-processing
-    # (stored flat in ledger file under special key "_scored")
-    scored_raw = state["trader_ledger"].pop("_scored", [])
-    state["_scored_markets"] = set(scored_raw)
+    saved = _load(F_LEDGER, {})
+    state["ledger"]      = saved.get("ledger", {})
+    state["scored_cids"] = set(saved.get("scored", []))
 
-    # Start background threads
+    # Rebuild top traders from loaded ledger
+    top = set()
+    for w, e in state["ledger"].items():
+        total = e.get("wins",0)+e.get("losses",0)
+        if total >= MIN_SCORED_TRADES and (e["wins"]/total) >= MIN_WIN_RATE:
+            top.add(w)
+    state["top_traders"] = top
+    state["stats"].update({"ledger_size": len(state["ledger"]), "top_traders": len(top)})
+    log.info(f"Loaded: {len(state['ledger'])} wallets, {len(state['scored_cids'])} scored, {len(top)} top traders")
+
     threading.Thread(target=main_loop, daemon=True).start()
-    if TELEGRAM_TOKEN:
-        if os.getenv("RAILWAY_PUBLIC_DOMAIN"):
-            # On Railway: use webhook (Telegram POSTs to /telegram)
-            threading.Thread(target=register_telegram_webhook, daemon=True).start()
-        else:
-            # Local dev: fall back to long-polling
-            threading.Thread(target=telegram_bot_loop, daemon=True).start()
-
+    setup_telegram()
     app.run(host="0.0.0.0", port=PORT)
