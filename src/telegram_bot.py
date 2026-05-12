@@ -23,12 +23,12 @@ ALLOWED_IDS = set(
 
 def auth_required(func):
     """Decorator to restrict commands to allowed users."""
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def wrapper(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         if ALLOWED_IDS and user_id not in ALLOWED_IDS:
             await update.message.reply_text("⛔ Unauthorized.")
             return
-        return await func(update, context)
+        return await func(self, update, context)
     return wrapper
 
 
