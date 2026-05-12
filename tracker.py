@@ -1,837 +1,665 @@
 """
-PMB — Polymarket Brain
-Railway Edition: Flask API + background polling + Telegram bot controls.
+PMB — Polymarket Brain | tracker.py
+Market-First Candle Copy Trader
 
-Fixes in this version:
-  - Telegram uses HTML parse mode — no more markdown entity errors
-  - Auto-buy uses correct py-clob-client API (no create_or_derive_api_creds)
-  - Only buys NEW signals — positions that existed before PMB started are skipped
-  - Separate notification vs buy dedup — alerts and buys tracked independently
-  - New signals store tracks first-seen timestamp per market
-
-Telegram commands:
-  /status               — current settings + today's spend + scan info
-  /autobuy on|off       — enable/disable auto-buying
-  /setsize <amount>     — trade size per signal (e.g. /setsize 25)
-  /setdailylimit <amt>  — max daily spend (e.g. /setdailylimit 100)
-  /setmaxprice <cents>  — max entry price in cents (e.g. /setmaxprice 70)
-  /setminoverlap <n>    — min traders overlapping to trigger (e.g. /setminoverlap 3)
-  /setcategory <cat>    — leaderboard category (OVERALL, CRYPTO, POLITICS...)
-  /setperiod <period>   — leaderboard time period (DAY, WEEK, MONTH, ALL)
-  /pause                — pause all scanning
-  /resume               — resume scanning
-  /help                 — show all commands
+Strategy:
+  1. Discover open BTC/ETH 5min & 15min candle markets
+  2. Pull recent trades per market to find active candle traders
+  3. Score each wallet on candle-market profitability only
+  4. Copy positions from top-performing candle traders in real time
 """
 
-import os
-import time
-import json
-import logging
-import threading
-import requests
+import os, json, time, logging, threading, re
 from datetime import datetime, timezone
 from collections import defaultdict
-from pathlib import Path
-from flask import Flask, jsonify, request
-from flask_cors import CORS
+from flask import Flask, jsonify
+import requests
 
-# ─── Logging ──────────────────────────────────────────────────────────────────
+# ─── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
 )
-log = logging.getLogger(__name__)
+log = logging.getLogger("PMB")
 
-# ─── Paths ────────────────────────────────────────────────────────────────────
-TRIGGERED_FILE   = Path("triggered.json")    # notified signals (once per day)
-BOUGHT_FILE      = Path("bought.json")       # bought markets (once per day)
-SETTINGS_FILE    = Path("settings.json")     # runtime settings
-FIRST_SEEN_FILE  = Path("first_seen.json")   # when each signal was first detected
+# ─── Env / Config ───────────────────────────────────────────────────────────
+DATA_API      = "https://data-api.polymarket.com"
+CLOB_HOST     = "https://clob.polymarket.com"
 
-DATA_API = "https://data-api.polymarket.com"
+POLL_INTERVAL_S      = int(os.getenv("POLL_INTERVAL_S",      "60"))    # main loop cadence
+MARKET_REFRESH_S     = int(os.getenv("MARKET_REFRESH_S",     "120"))   # re-discover markets
+TRADER_REFRESH_S     = int(os.getenv("TRADER_REFRESH_S",     "300"))   # re-score traders
+REQUEST_DELAY_S      = float(os.getenv("REQUEST_DELAY_S",    "0.5"))
 
-# ─── Fixed env vars ───────────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-PRIVATE_KEY      = os.getenv("POLYMARKET_PRIVATE_KEY", "")
-PORT             = int(os.getenv("PORT", "8080"))
+MIN_CANDLE_TRADES    = int(os.getenv("MIN_CANDLE_TRADES",    "10"))    # min history to trust
+MIN_WIN_RATE         = float(os.getenv("MIN_WIN_RATE",       "0.60"))  # 60 %
+MIN_POSITION_USD     = float(os.getenv("MIN_POSITION_USD",   "200"))
+MAX_ENTRY_PRICE      = float(os.getenv("MAX_ENTRY_PRICE",    "0.85"))
+TRADES_PER_MARKET    = int(os.getenv("TRADES_PER_MARKET",    "100"))
+TOP_TRADERS_WATCH    = int(os.getenv("TOP_TRADERS_WATCH",    "20"))    # wallets to follow
 
-VALID_CATEGORIES = {
-    "OVERALL", "POLITICS", "SPORTS", "CRYPTO",
-    "CULTURE", "ECONOMICS", "TECH", "FINANCE", "WEATHER",
+NOTIFY_THRESHOLD     = int(os.getenv("NOTIFY_THRESHOLD",     "1"))     # min traders in same position
+TELEGRAM_TOKEN       = os.getenv("TELEGRAM_TOKEN",  "")
+TELEGRAM_CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID", "")
+
+AUTOBUY_ENABLED      = os.getenv("AUTOBUY_ENABLED",  "false").lower() == "true"
+AUTOBUY_MIN_TRADERS  = int(os.getenv("AUTOBUY_MIN_TRADERS",  "2"))
+AUTOBUY_MAX_PRICE    = float(os.getenv("AUTOBUY_MAX_PRICE",  "0.70"))
+AUTOBUY_SIZE_USD     = float(os.getenv("AUTOBUY_SIZE_USD",   "10"))
+AUTOBUY_DAILY_LIMIT  = float(os.getenv("AUTOBUY_DAILY_LIMIT","50"))
+POLYMARKET_PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
+POLYMARKET_FUNDER    = os.getenv("POLYMARKET_FUNDER",  "")
+POLYMARKET_SIG_TYPE  = int(os.getenv("POLYMARKET_SIG_TYPE",  "0"))
+
+PORT = int(os.getenv("PORT", "8080"))
+
+# ─── Persistence helpers ─────────────────────────────────────────────────────
+TRIGGERED_FILE   = "triggered.json"
+BOUGHT_FILE      = "bought.json"
+SETTINGS_FILE    = "settings.json"
+LEDGER_FILE      = "trader_ledger.json"   # candle win/loss history per wallet
+
+def _load(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+def _save(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+# ─── Shared State ────────────────────────────────────────────────────────────
+state = {
+    "active_markets":  {},   # conditionId → market_info
+    "trader_ledger":   {},   # wallet → {wins, losses, volume_usd, last_seen}
+    "top_traders":     [],   # ranked list of wallets
+    "live_positions":  {},   # wallet → {conditionId → {outcome, size, price}}
+    "signals":         {},   # conditionId → {YES/NO: [wallet, ...]}
+    "triggered":       _load(TRIGGERED_FILE, {}),
+    "bought":          _load(BOUGHT_FILE, {"markets": {}, "spent_today": 0.0}),
+    "settings":        _load(SETTINGS_FILE, {}),
+    "stats": {
+        "markets_tracked": 0,
+        "traders_scored":  0,
+        "signals_today":   0,
+        "last_scan":       None,
+    },
 }
-VALID_PERIODS = {"DAY", "WEEK", "MONTH", "ALL"}
-
-# ─── Default settings ─────────────────────────────────────────────────────────
-DEFAULT_SETTINGS = {
-    "lb_time_period":      os.getenv("LB_TIME_PERIOD", "WEEK"),
-    "lb_order_by":         os.getenv("LB_ORDER_BY", "PNL"),
-    "lb_limit":        int(os.getenv("LB_LIMIT", "50")),
-    "lb_category":         os.getenv("LB_CATEGORY", "OVERALL"),
-    "lb_refresh_s":    int(os.getenv("LB_REFRESH_S", "900")),
-    "poll_interval_s": int(os.getenv("POLL_INTERVAL_S", "60")),
-    "request_delay_s":float(os.getenv("REQUEST_DELAY_S", "0.2")),
-    "min_overlap":     int(os.getenv("MIN_OVERLAP", "2")),
-    "min_position_usd":float(os.getenv("MIN_POSITION_USD", "100")),
-    "max_entry_price": float(os.getenv("MAX_ENTRY_PRICE", "0.85")),
-    "notify_threshold":int(os.getenv("NOTIFY_THRESHOLD", "2")),
-    "autobuy_enabled":     os.getenv("AUTOBUY_ENABLED", "false").lower() == "true",
-    "autobuy_min_overlap":int(os.getenv("AUTOBUY_MIN_OVERLAP", "2")),
-    "autobuy_max_price":  float(os.getenv("AUTOBUY_MAX_PRICE", "0.70")),
-    "autobuy_size_usd":   float(os.getenv("AUTOBUY_SIZE_USD", "10")),
-    "autobuy_daily_limit":float(os.getenv("AUTOBUY_DAILY_LIMIT", "100")),
-    "paused": False,
-}
-
-
-# ─── Persistence helpers ──────────────────────────────────────────────────────
-
-def load_settings() -> dict:
-    if SETTINGS_FILE.exists():
-        try:
-            saved  = json.loads(SETTINGS_FILE.read_text())
-            merged = {**DEFAULT_SETTINGS, **saved}
-            log.info("Settings loaded from disk")
-            return merged
-        except Exception as e:
-            log.warning(f"Could not load settings: {e}")
-    return dict(DEFAULT_SETTINGS)
-
-
-def save_settings(s: dict):
-    try:
-        SETTINGS_FILE.write_text(json.dumps(s, indent=2))
-    except Exception as e:
-        log.warning(f"Could not save settings: {e}")
-
-
-def _load_daily(path: Path, extra: dict = None) -> dict:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if path.exists():
-        try:
-            data = json.loads(path.read_text())
-            if data.get("date") == today:
-                return data
-        except Exception:
-            pass
-    base = {"date": today, "keys": []}
-    if extra:
-        base.update(extra)
-    return base
-
-
-def _save(path: Path, data: dict):
-    try:
-        path.write_text(json.dumps(data))
-    except Exception as e:
-        log.warning(f"Could not save {path}: {e}")
-
-
-def _maybe_reset(store: dict, path: Path, extra: dict = None) -> dict:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if store.get("date") != today:
-        log.info(f"New day — resetting {path.name}")
-        store = {"date": today, "keys": []}
-        if extra:
-            store.update(extra)
-        _save(path, store)
-    return store
-
-
-def load_first_seen() -> dict:
-    """Load first-seen timestamps — NOT reset daily, persists indefinitely."""
-    if FIRST_SEEN_FILE.exists():
-        try:
-            return json.loads(FIRST_SEEN_FILE.read_text())
-        except Exception:
-            pass
-    return {}
-
-
-def save_first_seen(data: dict):
-    try:
-        FIRST_SEEN_FILE.write_text(json.dumps(data))
-    except Exception as e:
-        log.warning(f"Could not save first_seen: {e}")
-
-
-# ─── Shared state ─────────────────────────────────────────────────────────────
-_lock            = threading.Lock()
-_settings        = load_settings()
-_triggered_store = _load_daily(TRIGGERED_FILE)
-_bought_store    = _load_daily(BOUGHT_FILE, {"total_spent": 0.0})
-_first_seen      = load_first_seen()   # { "conditionId|outcome": ISO timestamp }
-
-_state = {
-    "results":       None,
-    "leaderboard":   [],
-    "last_lb_fetch": 0,
-    "scan_count":    0,
-    "started_at":    datetime.now(timezone.utc).isoformat(),
-}
-
-# Track which keys existed on the very first scan so we never auto-buy them
-_baseline_keys: set = set()
-_baseline_set = False   # flipped to True after first scan completes
-
-
-# ─── Flask app ────────────────────────────────────────────────────────────────
-app = Flask(__name__)
-CORS(app, origins="*", methods=["GET", "POST"], allow_headers=["Content-Type"])
-
-
-@app.route("/")
-def index():
-    return jsonify({"status": "ok", "service": "PMB — Polymarket Brain"})
-
-
-@app.route("/results")
-def results():
-    with _lock:
-        if _state["results"] is None:
-            return jsonify({"status": "loading", "message": "First scan in progress..."}), 202
-        return jsonify(_state["results"])
-
-
-@app.route("/health")
-def health():
-    with _lock:
-        return jsonify({
-            "status":          "ok",
-            "scan_count":      _state["scan_count"],
-            "wallets_tracked": len(_state["leaderboard"]),
-            "started_at":      _state["started_at"],
-            "triggered_today": len(_triggered_store.get("keys", [])),
-            "bought_today":    len(_bought_store.get("keys", [])),
-            "spent_today":     _bought_store.get("total_spent", 0.0),
-            "paused":          _settings.get("paused", False),
-            "baseline_locked": _baseline_set,
-        })
-
-
-# ─── Telegram webhook ─────────────────────────────────────────────────────────
-@app.route("/telegram", methods=["POST"])
-def telegram_webhook():
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({"ok": True})
-
-    msg     = data.get("message") or data.get("edited_message") or {}
-    text    = msg.get("text", "").strip()
-    chat_id = str(msg.get("chat", {}).get("id", ""))
-
-    if chat_id != TELEGRAM_CHAT_ID:
-        log.warning(f"Ignoring message from unknown chat: {chat_id}")
-        return jsonify({"ok": True})
-
-    if not text.startswith("/"):
-        return jsonify({"ok": True})
-
-    parts   = text.split()
-    command = parts[0].lower().split("@")[0]
-    args    = parts[1:]
-
-    reply = handle_command(command, args)
-    if reply:
-        send_html(reply)
-
-    return jsonify({"ok": True})
-
-
-def handle_command(command: str, args: list) -> str:
-    global _settings
-
-    with _lock:
-        s = dict(_settings)
-
-    if command == "/help":
-        return (
-            "🤖 <b>PMB Bot Commands</b>\n\n"
-            "<code>/status</code> — settings and stats\n"
-            "<code>/autobuy on|off</code> — toggle auto-buying\n"
-            "<code>/setsize 25</code> — trade size per signal\n"
-            "<code>/setdailylimit 100</code> — max daily spend\n"
-            "<code>/setmaxprice 70</code> — max entry price in cents\n"
-            "<code>/setminoverlap 3</code> — min traders to trigger buy\n"
-            "<code>/setcategory CRYPTO</code> — leaderboard category\n"
-            "  Options: OVERALL CRYPTO POLITICS SPORTS\n"
-            "  ECONOMICS TECH FINANCE CULTURE\n"
-            "<code>/setperiod WEEK</code> — leaderboard period\n"
-            "  Options: DAY WEEK MONTH ALL\n"
-            "<code>/pause</code> — pause scanning\n"
-            "<code>/resume</code> — resume scanning\n"
-            "<code>/help</code> — show this message"
-        )
-
-    elif command == "/status":
-        with _lock:
-            scans   = _state["scan_count"]
-            wallets = len(_state["leaderboard"])
-            spent   = _bought_store.get("total_spent", 0.0)
-            bought  = len(_bought_store.get("keys", []))
-            alerted = len(_triggered_store.get("keys", []))
-
-        ab  = "✅ ON" if s["autobuy_enabled"] else "❌ OFF"
-        psd = "⏸ PAUSED" if s.get("paused") else "▶️ RUNNING"
-
-        return (
-            f"📊 <b>PMB Status</b>\n\n"
-            f"<b>Scanner:</b> {psd}\n"
-            f"<b>Scans run:</b> {scans}\n"
-            f"<b>Wallets tracked:</b> {wallets}\n"
-            f"<b>Signals today:</b> {alerted}\n\n"
-            f"<b>Auto-buy:</b> {ab}\n"
-            f"<b>Trade size:</b> <code>${s['autobuy_size_usd']:.0f}</code>\n"
-            f"<b>Daily limit:</b> <code>${s['autobuy_daily_limit']:.0f}</code>\n"
-            f"<b>Spent today:</b> <code>${spent:.2f}</code> ({bought} trades)\n"
-            f"<b>Max price:</b> <code>{s['autobuy_max_price']*100:.0f}c</code>\n"
-            f"<b>Min overlap:</b> <code>{s['autobuy_min_overlap']} traders</code>\n\n"
-            f"<b>Category:</b> <code>{s['lb_category']}</code>\n"
-            f"<b>Period:</b> <code>{s['lb_time_period']}</code>\n"
-            f"<b>Poll interval:</b> <code>{s['poll_interval_s']}s</code>"
-        )
-
-    elif command == "/autobuy":
-        if not args:
-            state = "ON" if s["autobuy_enabled"] else "OFF"
-            return f"Auto-buy is currently <b>{state}</b>. Use /autobuy on or /autobuy off."
-        val = args[0].lower()
-        if val == "on":
-            with _lock:
-                _settings["autobuy_enabled"] = True
-                save_settings(_settings)
-            return "✅ Auto-buy <b>enabled</b>."
-        elif val == "off":
-            with _lock:
-                _settings["autobuy_enabled"] = False
-                save_settings(_settings)
-            return "❌ Auto-buy <b>disabled</b>. You will still get alerts."
-        return "Usage: /autobuy on or /autobuy off"
-
-    elif command == "/setsize":
-        if not args:
-            return f"Current trade size: <code>${s['autobuy_size_usd']:.0f}</code>. Usage: /setsize 25"
-        try:
-            val = float(args[0].replace("$", ""))
-            if val <= 0:
-                return "❌ Trade size must be greater than $0."
-            if val > 1000:
-                return "❌ Trade size capped at $1000 for safety."
-            with _lock:
-                _settings["autobuy_size_usd"] = val
-                save_settings(_settings)
-            return f"✅ Trade size set to <code>${val:.0f}</code> per signal."
-        except ValueError:
-            return "❌ Invalid amount. Usage: /setsize 25"
-
-    elif command == "/setdailylimit":
-        if not args:
-            return f"Current daily limit: <code>${s['autobuy_daily_limit']:.0f}</code>. Usage: /setdailylimit 100"
-        try:
-            val = float(args[0].replace("$", ""))
-            if val <= 0:
-                return "❌ Daily limit must be greater than $0."
-            with _lock:
-                _settings["autobuy_daily_limit"] = val
-                save_settings(_settings)
-            return f"✅ Daily limit set to <code>${val:.0f}</code>."
-        except ValueError:
-            return "❌ Invalid amount. Usage: /setdailylimit 100"
-
-    elif command == "/setmaxprice":
-        if not args:
-            cur = s["autobuy_max_price"] * 100
-            return f"Current max price: <code>{cur:.0f}c</code>. Usage: /setmaxprice 70"
-        try:
-            val = float(args[0].replace("c", "").replace("%", ""))
-            if not 1 <= val <= 99:
-                return "❌ Price must be between 1 and 99."
-            with _lock:
-                _settings["autobuy_max_price"] = round(val / 100, 2)
-                save_settings(_settings)
-            return f"✅ Max entry price set to <code>{val:.0f}c</code>."
-        except ValueError:
-            return "❌ Invalid price. Usage: /setmaxprice 70"
-
-    elif command == "/setminoverlap":
-        if not args:
-            return f"Current min overlap: <code>{s['autobuy_min_overlap']}</code>. Usage: /setminoverlap 3"
-        try:
-            val = int(args[0])
-            if val < 2:
-                return "❌ Min overlap must be at least 2."
-            with _lock:
-                _settings["autobuy_min_overlap"] = val
-                save_settings(_settings)
-            return f"✅ Min overlap set to <code>{val} traders</code>."
-        except ValueError:
-            return "❌ Invalid number. Usage: /setminoverlap 3"
-
-    elif command == "/setcategory":
-        if not args:
-            opts = ", ".join(sorted(VALID_CATEGORIES))
-            return f"Current: <code>{s['lb_category']}</code>\nOptions: {opts}"
-        val = args[0].upper()
-        if val not in VALID_CATEGORIES:
-            return f"❌ Invalid. Options: {', '.join(sorted(VALID_CATEGORIES))}"
-        with _lock:
-            _settings["lb_category"]    = val
-            _state["last_lb_fetch"]     = 0
-            save_settings(_settings)
-        return f"✅ Category set to <code>{val}</code>. Refreshing wallets..."
-
-    elif command == "/setperiod":
-        if not args:
-            opts = ", ".join(sorted(VALID_PERIODS))
-            return f"Current: <code>{s['lb_time_period']}</code>\nOptions: {opts}"
-        val = args[0].upper()
-        if val not in VALID_PERIODS:
-            return f"❌ Invalid. Options: {', '.join(sorted(VALID_PERIODS))}"
-        with _lock:
-            _settings["lb_time_period"] = val
-            _state["last_lb_fetch"]     = 0
-            save_settings(_settings)
-        return f"✅ Period set to <code>{val}</code>. Refreshing wallets..."
-
-    elif command == "/pause":
-        with _lock:
-            _settings["paused"] = True
-            save_settings(_settings)
-        return "⏸ Scanner <b>paused</b>. Use /resume to restart."
-
-    elif command == "/resume":
-        with _lock:
-            _settings["paused"] = False
-            save_settings(_settings)
-        return "▶️ Scanner <b>resumed</b>."
-
-    else:
-        return f"Unknown command: <code>{command}</code>. Try /help."
-
-
-# ─── Telegram send helpers ────────────────────────────────────────────────────
-
-def _escape_html(text: str) -> str:
-    return (text
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;"))
-
-
-def send_html(text: str):
-    """Send a Telegram message using HTML parse mode."""
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        resp = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={
-                "chat_id":    TELEGRAM_CHAT_ID,
-                "text":       text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
-            timeout=10,
-        )
-        if not resp.ok:
-            log.error(f"Telegram error {resp.status_code}: {resp.text}")
-    except Exception as e:
-        log.error(f"Telegram exception: {e}")
-
-
-def setup_telegram_webhook(railway_url: str):
-    if not TELEGRAM_TOKEN or not railway_url:
-        return
-    webhook = f"{railway_url.rstrip('/')}/telegram"
-    try:
-        resp = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook",
-            json={"url": webhook},
-            timeout=10,
-        )
-        if resp.ok:
-            log.info(f"Telegram webhook registered: {webhook}")
-        else:
-            log.error(f"Webhook failed: {resp.text}")
-    except Exception as e:
-        log.error(f"Webhook exception: {e}")
-
-
-def notify_signal(signal: dict, is_new: bool):
-    emoji     = "🟢" if signal["outcome"].lower() == "yes" else "🔴"
-    pnl_emoji = "📈" if signal["avgPnl"] > 0 else "📉"
-    url       = f"https://polymarket.com/event/{signal.get('slug', '')}"
-    title     = _escape_html(signal["title"])
-
-    with _lock:
-        ab_enabled = _settings["autobuy_enabled"]
-        size       = _settings["autobuy_size_usd"]
-
-    if is_new and ab_enabled:
-        buy_note = f"\n💸 Auto-buying <code>${size:.0f}</code>..."
-    elif not is_new:
-        buy_note = "\n⏩ Existing position — skipping auto-buy"
-    else:
-        buy_note = "\n🔕 Auto-buy is OFF"
-
-    send_html(
-        f"🎯 <b>PMB Signal</b>\n\n"
-        f"{emoji} <b>{title}</b>\n"
-        f"Outcome: <b>{signal['outcome']}</b> @ <code>{signal['curPrice']:.3f}</code>\n\n"
-        f"👥 <b>{signal['holderCount']} top traders in this position</b>\n"
-        f"💰 Combined: <code>${signal['totalValue']:,.0f}</code>\n"
-        f"{pnl_emoji} Avg PnL: <code>{signal['avgPnl']:.1f}%</code>"
-        f"{buy_note}\n\n"
-        f"<a href='{url}'>View on Polymarket</a>"
-    )
-
+state_lock = threading.Lock()
+
+# ─── Candle Market Detection ──────────────────────────────────────────────────
+_CANDLE_KEYWORDS = re.compile(
+    r"(5.?min|15.?min|5-minute|15-minute)", re.IGNORECASE
+)
+_TIME_RANGE = re.compile(
+    r"\d{1,2}:\d{2}\s*(AM|PM)\s*[-–]\s*\d{1,2}:\d{2}\s*(AM|PM)", re.IGNORECASE
+)
+_HOUR_SLOT  = re.compile(
+    r"\d{1,2}\s*(AM|PM)\s*(ET|EST|EDT)", re.IGNORECASE
+)
+_UPDOWN     = re.compile(r"up or down", re.IGNORECASE)
+_BTC        = re.compile(r"bitcoin|btc", re.IGNORECASE)
+_ETH        = re.compile(r"ethereum|eth\b", re.IGNORECASE)
+
+def _is_candle_market(title: str) -> bool:
+    """Return True for BTC/ETH 5min or 15min candle markets."""
+    if not (_BTC.search(title) or _ETH.search(title)):
+        return False
+    if _CANDLE_KEYWORDS.search(title):
+        return True
+    if _UPDOWN.search(title):
+        # "Bitcoin Up or Down - May 8, 1:30PM-1:35PM ET"  → 5-min window
+        if _TIME_RANGE.search(title):
+            return True
+        # "Bitcoin Up or Down - May 8, 1PM ET" → hourly (skip)
+        if _HOUR_SLOT.search(title) and not _TIME_RANGE.search(title):
+            return False
+    return False
+
+def _candle_window(title: str) -> int:
+    """Return 5 or 15 based on title; default 5."""
+    if re.search(r"15.?min|15-minute", title, re.IGNORECASE):
+        return 15
+    return 5
 
 # ─── API helpers ──────────────────────────────────────────────────────────────
-def get_api(url, params=None, retries=3):
+_session = requests.Session()
+_session.headers.update({"User-Agent": "PMB/2.0"})
+
+def _get(url, params=None, retries=3):
     for attempt in range(retries):
         try:
-            r = requests.get(url, params=params, timeout=15)
+            r = _session.get(url, params=params, timeout=10)
             r.raise_for_status()
             return r.json()
         except Exception as e:
-            log.warning(f"GET {url} failed (attempt {attempt+1}): {e}")
-            time.sleep(2 ** attempt)
-    return None
+            if attempt == retries - 1:
+                log.warning(f"GET failed {url}: {e}")
+                return None
+            time.sleep(1)
 
-
-# ─── Leaderboard ──────────────────────────────────────────────────────────────
-def fetch_leaderboard() -> list:
-    with _lock:
-        s = dict(_settings)
-
-    data = get_api(f"{DATA_API}/v1/leaderboard", {
-        "timePeriod": s["lb_time_period"],
-        "orderBy":    s["lb_order_by"],
-        "limit":      s["lb_limit"],
-        "category":   s["lb_category"],
-    })
-
-    if not isinstance(data, list) or not data:
-        log.warning("Leaderboard returned no data")
-        return []
-
-    wallets = [
-        e.get("proxyWallet", "")
-        for e in data
-        if e.get("proxyWallet", "").startswith("0x")
-    ]
-
-    log.info(f"Leaderboard: {len(wallets)} wallets "
-             f"({s['lb_category']} / {s['lb_time_period']} / {s['lb_order_by']})")
-
-    for e in data[:5]:
-        log.info(f"  #{e.get('rank')} {e.get('userName','anon')} "
-                 f"PnL=${e.get('pnl',0):,.0f} Vol=${e.get('vol',0):,.0f}")
-
-    return wallets
-
-
-# ─── Positions ────────────────────────────────────────────────────────────────
-def fetch_positions(wallet: str) -> list:
-    with _lock:
-        threshold = _settings["min_position_usd"]
-    data = get_api(f"{DATA_API}/positions", {
-        "user":          wallet,
-        "sizeThreshold": max(threshold / 10, 10),
-    })
-    return data if isinstance(data, list) else []
-
-
-# ─── Overlap detection ────────────────────────────────────────────────────────
-def detect_overlaps(wallets: list) -> list:
-    with _lock:
-        s = dict(_settings)
-
-    market_holders = defaultdict(list)
-
-    for i, wallet in enumerate(wallets):
-        positions = fetch_positions(wallet)
-        for pos in positions:
-            cid           = pos.get("conditionId", "")
-            outcome       = pos.get("outcome", "")
-            cur_price     = pos.get("curPrice", 1.0)
-            current_value = pos.get("currentValue", 0)
-
-            if current_value < s["min_position_usd"]:
-                continue
-            if cur_price > s["max_entry_price"]:
-                continue
-
-            key = f"{cid}|{outcome}"
-            market_holders[key].append({
-                "wallet":       wallet,
-                "conditionId":  cid,
-                "outcome":      outcome,
-                "curPrice":     cur_price,
-                "currentValue": current_value,
-                "title":        pos.get("title", "Unknown"),
-                "slug":         pos.get("slug", ""),
-                "size":         pos.get("size", 0),
-                "avgPrice":     pos.get("avgPrice", 0),
-                "percentPnl":   pos.get("percentPnl", 0),
-            })
-
-        if i < len(wallets) - 1:
-            time.sleep(s["request_delay_s"])
-
-    overlaps = []
-    for key, holders in market_holders.items():
-        if len(holders) >= s["min_overlap"]:
-            h = holders[0]
-            overlaps.append({
-                "conditionId": h["conditionId"],
-                "outcome":     h["outcome"],
-                "title":       h["title"],
-                "slug":        h["slug"],
-                "curPrice":    h["curPrice"],
-                "holderCount": len(holders),
-                "holders":     holders,
-                "totalValue":  sum(x["currentValue"] for x in holders),
-                "avgPnl":      sum(x["percentPnl"] for x in holders) / len(holders),
-            })
-
-    overlaps.sort(key=lambda x: x["holderCount"], reverse=True)
-    return overlaps
-
-
-# ─── Auto-buy ─────────────────────────────────────────────────────────────────
-def attempt_autobuy(signal: dict) -> bool:
-    with _lock:
-        s     = dict(_settings)
-        spent = _bought_store.get("total_spent", 0.0)
-
-    if not s["autobuy_enabled"]:
-        return False
-
-    remaining = s["autobuy_daily_limit"] - spent
-    if remaining <= 0:
-        log.warning("Daily auto-buy limit reached")
-        send_html("⚠️ Daily auto-buy limit reached. No more buys today.")
-        return False
-
-    if not PRIVATE_KEY:
-        log.error("No POLYMARKET_PRIVATE_KEY set")
-        return False
-
-    size_usd = min(s["autobuy_size_usd"], remaining)
-    title    = _escape_html(signal["title"])
-
+def _telegram(msg: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
     try:
-        from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
-        from py_clob_client.constants import POLYGON
-
-        # Correct auth flow for py-clob-client (no v2)
-        client = ClobClient(
-            host     = "https://clob.polymarket.com",
-            key      = PRIVATE_KEY,
-            chain_id = POLYGON,
+        _session.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+            timeout=10,
         )
+    except Exception as e:
+        log.warning(f"Telegram error: {e}")
 
-        # Derive L2 API credentials from L1 wallet key
-        api_creds = client.derive_api_key()
-        client.set_api_creds(ApiCreds(
-            api_key        = api_creds["apiKey"],
-            api_secret     = api_creds["secret"],
-            api_passphrase = api_creds["passphrase"],
-        ))
+# ─── Step 1: Discover Active Candle Markets ───────────────────────────────────
+def discover_candle_markets():
+    """
+    Fetch open markets from Polymarket and filter to BTC/ETH 5/15min candles.
+    Uses /markets endpoint with tag-based filtering where possible.
+    """
+    found = {}
+    for tag in ["bitcoin", "ethereum"]:
+        data = _get(f"{DATA_API}/markets", params={
+            "tag": tag, "closed": "false", "limit": 200
+        })
+        if not data:
+            continue
+        markets = data if isinstance(data, list) else data.get("data", [])
+        for m in markets:
+            title = m.get("question") or m.get("title") or ""
+            cid   = m.get("conditionId") or m.get("condition_id") or m.get("id")
+            if not cid:
+                continue
+            if _is_candle_market(title):
+                found[cid] = {
+                    "conditionId": cid,
+                    "title":       title,
+                    "window_min":  _candle_window(title),
+                    "asset":       "BTC" if _BTC.search(title) else "ETH",
+                    "outcomes":    m.get("outcomes", ["YES", "NO"]),
+                    "token_ids":   m.get("clobTokenIds") or m.get("token_ids") or [],
+                    "end_date":    m.get("endDate") or m.get("end_date"),
+                }
+        time.sleep(REQUEST_DELAY_S)
 
-        # Resolve token ID for the outcome
-        market_info   = client.get_market(condition_id=signal["conditionId"])
-        tokens        = market_info.get("tokens", [])
-        outcome_index = 0 if signal["outcome"].lower() == "yes" else 1
+    log.info(f"Discovered {len(found)} active candle markets")
+    return found
 
-        if outcome_index >= len(tokens):
-            log.error(f"Could not resolve token for outcome: {signal['outcome']}")
-            return False
+# ─── Step 2: Pull Recent Trades Per Market ────────────────────────────────────
+def fetch_market_trades(condition_id: str) -> list:
+    data = _get(f"{DATA_API}/trades", params={
+        "market": condition_id,
+        "limit":  TRADES_PER_MARKET,
+    })
+    if not data:
+        return []
+    return data if isinstance(data, list) else data.get("data", [])
 
-        token_id = tokens[outcome_index]["token_id"]
+# ─── Step 3: Score Traders on Candle Markets ──────────────────────────────────
+def update_trader_ledger(markets: dict):
+    """
+    For every known candle market with a resolved outcome,
+    mark each trader's trade as a win or loss and track volume.
+    """
+    ledger = state["trader_ledger"]
 
-        # Place order
-        order = client.create_order(OrderArgs(
-            token_id = token_id,
-            price    = round(signal["curPrice"] + 0.01, 3),
-            size     = round(size_usd / signal["curPrice"], 2),
-            side     = "BUY",
-        ))
-        resp = client.post_order(order, OrderType.GTC)
+    for cid, mkt in markets.items():
+        trades = fetch_market_trades(cid)
+        time.sleep(REQUEST_DELAY_S)
 
-        if resp and resp.get("success"):
-            order_id = resp.get("orderID", "unknown")
-            with _lock:
-                _bought_store["total_spent"] += size_usd
-                save_bought(_bought_store)
-            log.info(f"Auto-buy success: {order_id} ${size_usd:.0f}")
-            send_html(
-                f"✅ <b>Auto-buy executed</b>\n"
-                f"{title}\n"
-                f"{signal['outcome']} @ <code>{signal['curPrice']:.3f}</code>\n"
-                f"Size: <code>${size_usd:.0f}</code> | Order: <code>{order_id}</code>"
+        # Determine resolved outcome if available
+        resolved = mkt.get("resolved_outcome")  # set by market refresh
+
+        for t in trades:
+            wallet  = t.get("maker") or t.get("user") or t.get("trader")
+            outcome = t.get("outcome") or t.get("side")    # "YES"/"NO"
+            size    = float(t.get("size") or t.get("amount") or 0)
+            price   = float(t.get("price") or 0)
+            usd_val = size * price
+
+            if not wallet or usd_val < 1:
+                continue
+
+            if wallet not in ledger:
+                ledger[wallet] = {
+                    "wins": 0, "losses": 0,
+                    "volume_usd": 0.0,
+                    "markets_traded": set(),
+                    "last_seen": None,
+                }
+
+            entry = ledger[wallet]
+            entry["volume_usd"] += usd_val
+            entry["markets_traded"].add(cid)
+            entry["last_seen"] = datetime.now(timezone.utc).isoformat()
+
+            # Score win/loss only for resolved markets
+            if resolved and outcome:
+                if outcome.upper() == resolved.upper():
+                    entry["wins"] += 1
+                else:
+                    entry["losses"] += 1
+
+    # Serialise sets for JSON
+    for w, e in ledger.items():
+        if isinstance(e.get("markets_traded"), set):
+            e["markets_traded"] = list(e["markets_traded"])
+
+    _save(LEDGER_FILE, ledger)
+    log.info(f"Ledger updated: {len(ledger)} traders tracked")
+
+def rank_traders() -> list:
+    """
+    Return wallets sorted by win-rate, filtered by minimum trade count.
+    Wallets with no resolved trades yet are ranked by volume (potential).
+    """
+    ledger = state["trader_ledger"]
+    scored = []
+    for wallet, e in ledger.items():
+        total = e["wins"] + e["losses"]
+        win_rate = (e["wins"] / total) if total > 0 else None
+        if total > 0 and total < MIN_CANDLE_TRADES:
+            continue   # not enough history
+        scored.append({
+            "wallet":    wallet,
+            "win_rate":  win_rate,
+            "wins":      e["wins"],
+            "losses":    e["losses"],
+            "total":     total,
+            "volume_usd": e["volume_usd"],
+            "last_seen": e.get("last_seen"),
+        })
+
+    # Sort: wallets with resolved history first (by win_rate), then by volume
+    def _sort_key(x):
+        if x["win_rate"] is not None:
+            return (1, x["win_rate"], x["volume_usd"])
+        return (0, 0, x["volume_usd"])
+
+    ranked = sorted(scored, key=_sort_key, reverse=True)
+    qualified = [r for r in ranked if r["win_rate"] is None or r["win_rate"] >= MIN_WIN_RATE]
+    log.info(f"Ranked {len(ranked)} traders; {len(qualified)} qualified (≥{MIN_WIN_RATE:.0%} win rate)")
+    return qualified[:TOP_TRADERS_WATCH]
+
+# ─── Step 4: Watch Live Positions of Top Traders ─────────────────────────────
+def fetch_wallet_positions(wallet: str) -> dict:
+    data = _get(f"{DATA_API}/positions", params={"user": wallet})
+    if not data:
+        return {}
+    positions = data if isinstance(data, list) else data.get("data", [])
+    result = {}
+    for p in positions:
+        cid     = p.get("conditionId") or p.get("condition_id") or p.get("market")
+        outcome = p.get("outcome") or p.get("side")
+        size    = float(p.get("size") or p.get("amount") or 0)
+        price   = float(p.get("avgPrice") or p.get("price") or 0)
+        usd     = size * price
+        if cid and usd >= MIN_POSITION_USD:
+            result[cid] = {"outcome": outcome, "size_usd": usd, "price": price}
+    return result
+
+def scan_top_trader_positions():
+    """
+    For each top trader, fetch their open positions.
+    Only flag positions that are in our tracked candle markets.
+    """
+    top_traders  = state["top_traders"]
+    active_mkts  = state["active_markets"]
+    signals      = defaultdict(lambda: defaultdict(list))   # cid → outcome → [wallets]
+
+    for trader in top_traders:
+        wallet = trader["wallet"]
+        positions = fetch_wallet_positions(wallet)
+        time.sleep(REQUEST_DELAY_S)
+
+        for cid, pos in positions.items():
+            if cid not in active_mkts:
+                continue   # not a candle market we track
+            outcome = (pos.get("outcome") or "").upper()
+            price   = pos.get("price", 0)
+            if outcome and price <= MAX_ENTRY_PRICE:
+                signals[cid][outcome].append({
+                    "wallet":    wallet,
+                    "win_rate":  trader.get("win_rate"),
+                    "size_usd":  pos["size_usd"],
+                    "price":     price,
+                })
+
+    return signals
+
+# ─── Alerts & Auto-buy ────────────────────────────────────────────────────────
+def today_key():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def _already_triggered(cid, outcome):
+    key = f"{cid}:{outcome}:{today_key()}"
+    return key in state["triggered"]
+
+def _mark_triggered(cid, outcome):
+    key = f"{cid}:{outcome}:{today_key()}"
+    state["triggered"][key] = datetime.now(timezone.utc).isoformat()
+    _save(TRIGGERED_FILE, state["triggered"])
+
+def send_signal_alert(cid, outcome, holders, mkt_info):
+    title   = mkt_info.get("title", cid)
+    asset   = mkt_info.get("asset", "")
+    window  = mkt_info.get("window_min", 5)
+    prices  = [h["price"] for h in holders]
+    avg_px  = sum(prices) / len(prices) if prices else 0
+    wr_list = [f"{h['win_rate']:.0%}" if h["win_rate"] else "?" for h in holders]
+
+    msg = (
+        f"🕯️ <b>PMB Candle Signal</b>\n"
+        f"<b>{asset} {window}min</b> → <b>{outcome}</b>\n"
+        f"📋 {title}\n"
+        f"👥 {len(holders)} top trader(s) holding {outcome}\n"
+        f"💰 Avg price: {avg_px:.2f}\n"
+        f"📊 Win rates: {', '.join(wr_list)}\n"
+        f"🔗 https://polymarket.com/event/{cid}"
+    )
+    _telegram(msg)
+    log.info(f"SIGNAL: {asset} {window}min {outcome} @ {avg_px:.2f} ({len(holders)} traders)")
+    state["stats"]["signals_today"] += 1
+
+def attempt_autobuy(cid, outcome, holders, mkt_info):
+    if not AUTOBUY_ENABLED:
+        return
+    settings = state["settings"]
+    min_t    = settings.get("autobuy_min_traders", AUTOBUY_MIN_TRADERS)
+    max_px   = settings.get("autobuy_max_price",   AUTOBUY_MAX_PRICE)
+    size     = settings.get("autobuy_size_usd",    AUTOBUY_SIZE_USD)
+    daily    = settings.get("autobuy_daily_limit", AUTOBUY_DAILY_LIMIT)
+
+    if len(holders) < min_t:
+        return
+    avg_px = sum(h["price"] for h in holders) / len(holders)
+    if avg_px > max_px:
+        return
+    if state["bought"]["spent_today"] + size > daily:
+        log.info("Daily auto-buy limit reached")
+        return
+    if cid in state["bought"]["markets"]:
+        return   # already bought this market today
+
+    _execute_buy(cid, outcome, mkt_info, size, avg_px)
+
+def _execute_buy(cid, outcome, mkt_info, size_usd, price):
+    """Place a buy order via py_clob_client_v2."""
+    if not POLYMARKET_PRIVATE_KEY:
+        log.warning("No private key — skipping auto-buy")
+        return
+    try:
+        from py_clob_client_v2 import ClobClient, ApiCreds, OrderArgs, OrderType, Side
+        l1  = ClobClient(host=CLOB_HOST, chain_id=137, key=POLYMARKET_PRIVATE_KEY)
+        if POLYMARKET_SIG_TYPE == 1 and POLYMARKET_FUNDER:
+            creds = l1.create_or_derive_api_key(nonce=0)
+            client = ClobClient(
+                host=CLOB_HOST, chain_id=137, key=POLYMARKET_PRIVATE_KEY,
+                creds=creds, funder=POLYMARKET_FUNDER, signature_type=1,
             )
-            return True
         else:
-            log.error(f"Auto-buy failed: {resp}")
-            send_html(f"❌ Auto-buy failed for {title}")
-            return False
+            creds  = l1.create_or_derive_api_key()
+            client = ClobClient(host=CLOB_HOST, chain_id=137, key=POLYMARKET_PRIVATE_KEY, creds=creds)
 
-    except ImportError:
-        log.error("py-clob-client not installed. Add to requirements.txt")
-        return False
+        token_ids = mkt_info.get("token_ids", [])
+        outcomes  = mkt_info.get("outcomes", ["YES", "NO"])
+        try:
+            token_idx = outcomes.index(outcome)
+            token_id  = token_ids[token_idx]
+        except (ValueError, IndexError):
+            log.warning(f"Cannot resolve token_id for {outcome} in {cid}")
+            return
+
+        size_shares = round(size_usd / price, 4)
+        order = client.create_order(OrderArgs(
+            token_id   = token_id,
+            price      = price,
+            size       = size_shares,
+            side       = Side.BUY,
+            order_type = OrderType.GTC,
+        ))
+        resp = client.post_order(order)
+        log.info(f"Auto-buy placed: {outcome} @ {price} size={size_shares:.4f} → {resp}")
+
+        state["bought"]["markets"][cid] = {
+            "outcome": outcome, "price": price,
+            "size_usd": size_usd, "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        state["bought"]["spent_today"] = round(state["bought"]["spent_today"] + size_usd, 2)
+        _save(BOUGHT_FILE, state["bought"])
+
+        _telegram(
+            f"✅ <b>Auto-buy executed</b>\n"
+            f"{mkt_info.get('asset','')} {mkt_info.get('window_min',5)}min → {outcome}\n"
+            f"Price: {price:.2f} | Size: ${size_usd:.2f}"
+        )
     except Exception as e:
         log.error(f"Auto-buy error: {e}")
-        send_html(f"❌ Auto-buy error: <code>{_escape_html(str(e))}</code>")
-        return False
+        _telegram(f"⚠️ Auto-buy error: {e}")
 
-
-def _save_bought_store():
-    _save(BOUGHT_FILE, _bought_store)
-
-
-# ─── Polling loop ─────────────────────────────────────────────────────────────
-def polling_loop():
-    global _triggered_store, _bought_store, _first_seen, _baseline_keys, _baseline_set
-    last_positions_poll = 0
+# ─── Main Polling Loop ────────────────────────────────────────────────────────
+def main_loop():
+    last_market_refresh = 0
+    last_trader_refresh = 0
 
     while True:
         now = time.time()
 
-        # Daily resets
-        with _lock:
-            _triggered_store = _maybe_reset(_triggered_store, TRIGGERED_FILE)
-            _bought_store    = _maybe_reset(_bought_store, BOUGHT_FILE, {"total_spent": 0.0})
+        # Refresh candle market list
+        if now - last_market_refresh > MARKET_REFRESH_S:
+            with state_lock:
+                state["active_markets"] = discover_candle_markets()
+                state["stats"]["markets_tracked"] = len(state["active_markets"])
+            last_market_refresh = now
 
-        with _lock:
-            paused       = _settings.get("paused", False)
-            lb_refresh_s = _settings["lb_refresh_s"]
-            poll_s       = _settings["poll_interval_s"]
-            last_lb      = _state["last_lb_fetch"]
-            wallets      = _state["leaderboard"]
+        # Update trader ledger & re-rank
+        if now - last_trader_refresh > TRADER_REFRESH_S:
+            with state_lock:
+                update_trader_ledger(state["active_markets"])
+                state["top_traders"] = rank_traders()
+                state["stats"]["traders_scored"] = len(state["top_traders"])
+            last_trader_refresh = now
 
-        if paused:
-            time.sleep(10)
-            continue
+        # Scan positions of top traders
+        signals = scan_top_trader_positions()
 
-        # Refresh leaderboard
-        if now - last_lb > lb_refresh_s:
-            new_wallets = fetch_leaderboard()
-            if new_wallets:
-                with _lock:
-                    _state["leaderboard"]   = new_wallets
-                    _state["last_lb_fetch"] = now
-                wallets = new_wallets
+        with state_lock:
+            state["signals"] = {k: dict(v) for k, v in signals.items()}
 
-        if not wallets:
-            log.info("Waiting for leaderboard wallets...")
-            time.sleep(30)
-            continue
+        # Fire alerts
+        for cid, outcomes in signals.items():
+            mkt_info = state["active_markets"].get(cid, {})
+            for outcome, holders in outcomes.items():
+                if len(holders) < NOTIFY_THRESHOLD:
+                    continue
+                if _already_triggered(cid, outcome):
+                    continue
+                send_signal_alert(cid, outcome, holders, mkt_info)
+                _mark_triggered(cid, outcome)
+                attempt_autobuy(cid, outcome, holders, mkt_info)
 
-        # Scan positions
-        if now - last_positions_poll >= poll_s:
-            log.info(f"Scanning {len(wallets)} wallets...")
-            overlaps = detect_overlaps(wallets)
+        state["stats"]["last_scan"] = datetime.now(timezone.utc).isoformat()
+        log.info(
+            f"Scan done | markets={state['stats']['markets_tracked']} "
+            f"traders={state['stats']['traders_scored']} "
+            f"signals={len(signals)}"
+        )
+        time.sleep(POLL_INTERVAL_S)
 
-            # On first scan, record all current signals as baseline
-            # These are pre-existing positions — we notify but don't auto-buy them
-            with _lock:
-                if not _baseline_set:
-                    _baseline_keys = {
-                        f"{s['conditionId']}|{s['outcome']}"
-                        for s in overlaps
-                    }
-                    _baseline_set = True
-                    log.info(f"Baseline set: {len(_baseline_keys)} pre-existing signals "
-                             f"(will not be auto-bought)")
+# ─── Telegram Bot Commands ────────────────────────────────────────────────────
+def telegram_bot_loop():
+    offset = None
+    while True:
+        try:
+            params = {"timeout": 30}
+            if offset:
+                params["offset"] = offset
+            r = _session.get(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                params=params, timeout=35,
+            )
+            updates = r.json().get("result", [])
+            for u in updates:
+                offset = u["update_id"] + 1
+                msg    = u.get("message", {})
+                text   = msg.get("text", "").strip()
+                chat   = str(msg.get("chat", {}).get("id", ""))
+                if chat != TELEGRAM_CHAT_ID:
+                    continue
+                _handle_command(text)
+        except Exception as e:
+            log.warning(f"Telegram poll error: {e}")
+        time.sleep(1)
 
-            # Record first-seen timestamps for new signals
-            now_iso = datetime.now(timezone.utc).isoformat()
-            with _lock:
-                for signal in overlaps:
-                    key = f"{signal['conditionId']}|{signal['outcome']}"
-                    if key not in _first_seen:
-                        _first_seen[key] = now_iso
-                        save_first_seen(_first_seen)
+def _handle_command(text: str):
+    s = state["settings"]
+    parts = text.split()
+    cmd   = parts[0].lower() if parts else ""
 
-            with _lock:
-                _state["scan_count"] += 1
-                _state["results"] = {
-                    "timestamp":   now_iso,
-                    "walletCount": len(wallets),
-                    "scanCount":   _state["scan_count"],
-                    "overlaps":    overlaps,
-                    "config": {
-                        "minOverlap":        _settings["min_overlap"],
-                        "pollIntervalS":     _settings["poll_interval_s"],
-                        "leaderboardWindow": _settings["lb_time_period"],
-                        "category":          _settings["lb_category"],
-                        "autobuyEnabled":    _settings["autobuy_enabled"],
-                    },
-                }
+    def reply(msg):
+        _telegram(msg)
 
-            log.info(f"Scan #{_state['scan_count']}: {len(overlaps)} signals found")
+    if cmd == "/status":
+        st = state["stats"]
+        reply(
+            f"📊 <b>PMB Status</b>\n"
+            f"Markets tracked: {st['markets_tracked']}\n"
+            f"Traders scored:  {st['traders_scored']}\n"
+            f"Signals today:   {st['signals_today']}\n"
+            f"Spent today:     ${state['bought']['spent_today']:.2f}\n"
+            f"Autobuy:         {'ON' if s.get('autobuy_enabled', AUTOBUY_ENABLED) else 'OFF'}\n"
+            f"Last scan:       {st['last_scan']}"
+        )
+    elif cmd == "/autobuy":
+        val = parts[1].lower() if len(parts) > 1 else ""
+        s["autobuy_enabled"] = (val == "on")
+        _save(SETTINGS_FILE, s); reply(f"Autobuy {'ON' if s['autobuy_enabled'] else 'OFF'}")
 
-            for signal in overlaps:
-                key = f"{signal['conditionId']}|{signal['outcome']}"
+    elif cmd == "/setsize" and len(parts) > 1:
+        s["autobuy_size_usd"] = float(parts[1])
+        _save(SETTINGS_FILE, s); reply(f"Trade size set to ${s['autobuy_size_usd']}")
 
-                with _lock:
-                    already_notified = key in _triggered_store["keys"]
-                    already_bought   = key in _bought_store["keys"]
-                    is_baseline      = key in _baseline_keys
-                    ab_enabled       = _settings["autobuy_enabled"]
-                    ab_min_overlap   = _settings["autobuy_min_overlap"]
-                    ab_max_price     = _settings["autobuy_max_price"]
+    elif cmd == "/setdailylimit" and len(parts) > 1:
+        s["autobuy_daily_limit"] = float(parts[1])
+        _save(SETTINGS_FILE, s); reply(f"Daily limit set to ${s['autobuy_daily_limit']}")
 
-                # New signal — notify once
-                if not already_notified:
-                    is_new = not is_baseline
-                    notify_signal(signal, is_new=is_new)
-                    with _lock:
-                        _triggered_store["keys"].append(key)
-                        _save(TRIGGERED_FILE, _triggered_store)
-                    log.info(f"Notified: {signal['title']} | "
-                             f"new={is_new} baseline={is_baseline}")
+    elif cmd == "/setmaxprice" and len(parts) > 1:
+        s["autobuy_max_price"] = float(parts[1]) / 100 if float(parts[1]) > 1 else float(parts[1])
+        _save(SETTINGS_FILE, s); reply(f"Max price set to {s['autobuy_max_price']:.2f}")
 
-                # Auto-buy only if:
-                # - Not a baseline (pre-existing) position
-                # - Not already bought today
-                # - Meets overlap + price thresholds
-                if (ab_enabled
-                        and not is_baseline
-                        and not already_bought
-                        and signal["holderCount"] >= ab_min_overlap
-                        and signal["curPrice"] <= ab_max_price):
-                    success = attempt_autobuy(signal)
-                    if success:
-                        with _lock:
-                            _bought_store["keys"].append(key)
-                            _save(BOUGHT_FILE, _bought_store)
+    elif cmd == "/setmintraders" and len(parts) > 1:
+        s["autobuy_min_traders"] = int(parts[1])
+        _save(SETTINGS_FILE, s); reply(f"Min traders to copy set to {s['autobuy_min_traders']}")
 
-            last_positions_poll = now
+    elif cmd == "/setwinrate" and len(parts) > 1:
+        s["min_win_rate"] = float(parts[1]) / 100 if float(parts[1]) > 1 else float(parts[1])
+        _save(SETTINGS_FILE, s); reply(f"Min win rate set to {s['min_win_rate']:.0%}")
 
-        time.sleep(10)
+    elif cmd == "/toptraders":
+        top = state["top_traders"][:10]
+        if not top:
+            reply("No traders ranked yet."); return
+        lines = ["👑 <b>Top Candle Traders</b>"]
+        for i, t in enumerate(top, 1):
+            wr = f"{t['win_rate']:.0%}" if t["win_rate"] else "?"
+            lines.append(f"{i}. {t['wallet'][:8]}… WR={wr} ({t['wins']}W/{t['losses']}L) ${t['volume_usd']:.0f}")
+        reply("\n".join(lines))
 
+    elif cmd == "/markets":
+        mkts = list(state["active_markets"].values())[:10]
+        if not mkts:
+            reply("No candle markets found yet."); return
+        lines = ["🕯️ <b>Active Candle Markets</b>"]
+        for m in mkts:
+            lines.append(f"• {m['asset']} {m['window_min']}min — {m['title'][:60]}")
+        reply("\n".join(lines))
 
-# ─── Entry point ──────────────────────────────────────────────────────────────
+    elif cmd == "/signals":
+        sigs = state["signals"]
+        if not sigs:
+            reply("No active signals."); return
+        lines = ["🚨 <b>Current Signals</b>"]
+        for cid, outcomes in list(sigs.items())[:5]:
+            mkt = state["active_markets"].get(cid, {})
+            for outcome, holders in outcomes.items():
+                lines.append(f"• {mkt.get('asset','')} {mkt.get('window_min','')}min → {outcome} ({len(holders)} traders)")
+        reply("\n".join(lines))
+
+    elif cmd == "/pause":
+        s["paused"] = True;  _save(SETTINGS_FILE, s); reply("⏸ Scanning paused")
+    elif cmd == "/resume":
+        s["paused"] = False; _save(SETTINGS_FILE, s); reply("▶️ Scanning resumed")
+
+    elif cmd == "/help":
+        reply(
+            "📖 <b>PMB Commands</b>\n"
+            "/status — stats overview\n"
+            "/toptraders — ranked candle traders\n"
+            "/markets — active BTC/ETH candle markets\n"
+            "/signals — current live signals\n"
+            "/autobuy on|off — toggle auto-buy\n"
+            "/setsize 10 — $ per trade\n"
+            "/setdailylimit 50 — max daily spend\n"
+            "/setmaxprice 70 — max entry (cents)\n"
+            "/setmintraders 2 — min traders to trigger buy\n"
+            "/setwinrate 60 — min win rate % to follow trader\n"
+            "/pause | /resume"
+        )
+
+# ─── Flask API ────────────────────────────────────────────────────────────────
+app = Flask(__name__)
+
+@app.route("/")
+def health():
+    return jsonify({"status": "ok", "stats": state["stats"]})
+
+@app.route("/signals")
+def api_signals():
+    out = []
+    for cid, outcomes in state["signals"].items():
+        mkt = state["active_markets"].get(cid, {})
+        for outcome, holders in outcomes.items():
+            out.append({
+                "conditionId": cid,
+                "title":       mkt.get("title"),
+                "asset":       mkt.get("asset"),
+                "window_min":  mkt.get("window_min"),
+                "outcome":     outcome,
+                "holder_count": len(holders),
+                "holders":     holders,
+                "avg_price":   round(sum(h["price"] for h in holders) / len(holders), 3) if holders else 0,
+            })
+    out.sort(key=lambda x: x["holder_count"], reverse=True)
+    return jsonify(out)
+
+@app.route("/markets")
+def api_markets():
+    return jsonify(list(state["active_markets"].values()))
+
+@app.route("/traders")
+def api_traders():
+    return jsonify(state["top_traders"])
+
+@app.route("/stats")
+def api_stats():
+    return jsonify({
+        **state["stats"],
+        "spent_today": state["bought"]["spent_today"],
+        "top_trader_count": len(state["top_traders"]),
+    })
+
+# ─── Entry point ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("Starting PMB — Polymarket Brain...")
+    log.info("PMB Candle Copy Trader starting…")
 
-    railway_url = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
-    if railway_url:
-        if not railway_url.startswith("http"):
-            railway_url = f"https://{railway_url}"
-        setup_telegram_webhook(railway_url)
-    else:
-        log.warning("RAILWAY_PUBLIC_DOMAIN not set — Telegram commands disabled")
+    # Load persisted ledger
+    state["trader_ledger"] = _load(LEDGER_FILE, {})
 
-    try:
-        t = threading.Thread(target=polling_loop, daemon=True)
-        t.start()
-        log.info("Polling thread started OK")
-    except Exception as e:
-        log.error(f"Thread failed to start: {e}")
+    # Start background threads
+    threading.Thread(target=main_loop,         daemon=True).start()
+    if TELEGRAM_TOKEN:
+        threading.Thread(target=telegram_bot_loop, daemon=True).start()
 
     app.run(host="0.0.0.0", port=PORT)
