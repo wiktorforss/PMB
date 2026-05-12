@@ -72,96 +72,74 @@ class PolymarketClient:
 
     async def get_active_crypto_markets(self) -> list[dict]:
         """
-        Fetch the 4 rolling short-term markets by generating their expected slugs.
+        Fetch the 4 rolling BTC/ETH 5min & 15min markets using Unix timestamp slugs.
 
-        Polymarket creates new markets every 5/15 minutes with slugs like:
-          bitcoin-up-or-down-may-12-1210am-1215am-et
-          ethereum-up-or-down-may-12-7pm-715pm-et
+        Slug format: {asset}-updown-{timeframe}-{unix_timestamp}
+        e.g. btc-updown-5m-1778627100, eth-updown-15m-1778626800
 
-        We generate the current slug for each of the 4 markets, plus the next
-        window, so we always have a market ready even near interval boundaries.
+        The timestamp is the UTC Unix time of the window start,
+        floored to 300s (5min) or 900s (15min).
+        We fetch current + next window per market to handle boundary timing.
         """
+        import time as _time
+
+        now = int(_time.time())
+        w5  = (now // 300) * 300   # current 5-min window start
+        w15 = (now // 900) * 900   # current 15-min window start
+
+        # (slug, asset, timeframe) for current + next window
+        targets = [
+            (f"btc-updown-5m-{w5}",        "BTC", "5min"),
+            (f"btc-updown-5m-{w5 + 300}",  "BTC", "5min"),
+            (f"btc-updown-15m-{w15}",       "BTC", "15min"),
+            (f"btc-updown-15m-{w15 + 900}", "BTC", "15min"),
+            (f"eth-updown-5m-{w5}",         "ETH", "5min"),
+            (f"eth-updown-5m-{w5 + 300}",   "ETH", "5min"),
+            (f"eth-updown-15m-{w15}",        "ETH", "15min"),
+            (f"eth-updown-15m-{w15 + 900}",  "ETH", "15min"),
+        ]
+
         markets = []
         seen_ids: set = set()
 
-        for slug_info in self._get_current_slugs():
+        for slug, asset, timeframe in targets:
             try:
                 async with self.session.get(
-                    f"{GAMMA_API}/markets",
-                    params={"slug": slug_info["slug"]}
+                    f"{GAMMA_API}/events",
+                    params={"slug": slug}
                 ) as resp:
                     if resp.status != 200:
                         continue
                     data = await resp.json()
-                    raw = data if isinstance(data, list) else data.get("markets", [])
+                    events = data if isinstance(data, list) else [data]
 
-                    for market in raw:
-                        mid = market.get("id")
-                        if not mid or mid in seen_ids:
-                            continue
-                        seen_ids.add(mid)
-                        markets.append({
-                            "id": mid,
-                            "condition_id": market.get("conditionId"),
-                            "question": market.get("question", ""),
-                            "slug": market.get("slug", ""),
-                            "asset": slug_info["asset"],
-                            "timeframe": slug_info["timeframe"],
-                            "tokens": market.get("tokens", []),
-                            "volume": float(market.get("volume") or 0),
-                            "liquidity": float(market.get("liquidity") or 0),
-                            "end_date": market.get("endDate"),
-                        })
+                    for event in events:
+                        for market in event.get("markets", []):
+                            mid = market.get("id")
+                            if not mid or mid in seen_ids:
+                                continue
+                            seen_ids.add(mid)
+                            markets.append({
+                                "id": mid,
+                                "condition_id": market.get("conditionId"),
+                                "question": market.get("question", ""),
+                                "slug": slug,
+                                "asset": asset,
+                                "timeframe": timeframe,
+                                "tokens": market.get("tokens", []),
+                                "volume": float(event.get("volume") or 0),
+                                "liquidity": float(event.get("liquidity") or 0),
+                                "end_date": market.get("endDate"),
+                            })
             except Exception as e:
-                logger.warning(f"Slug fetch failed for {slug_info['slug']}: {e}")
+                logger.warning(f"Failed to fetch {slug}: {e}")
 
-        if not markets:
-            tried = [s["slug"] for s in self._get_current_slugs()[:4]]
-            logger.warning(f"No markets found. Tried slugs: {tried}")
-        else:
+        if markets:
             logger.info(f"Found {len(markets)} active BTC/ETH short-term markets")
+        else:
+            logger.warning(f"No markets found — tried slugs like btc-updown-5m-{w5}")
 
         return markets
-
-    def _get_current_slugs(self) -> list[dict]:
-        """
-        Generate expected slugs for BTC/ETH 5min and 15min markets.
-        Returns current window + next window for each of the 4 market types.
-        """
-        from datetime import datetime, timezone, timedelta
-
-        now_utc = datetime.now(timezone.utc)
-        # EDT (UTC-4) Mar-Nov, EST (UTC-5) otherwise
-        month = now_utc.month
-        et_offset = timedelta(hours=-4) if 3 <= month <= 11 else timedelta(hours=-5)
-        now_et = now_utc + et_offset
-
-        slugs = []
-        for asset in ["BTC", "ETH"]:
-            for minutes, tf_label in [(5, "5min"), (15, "15min")]:
-                for window_offset in [0, 1]:  # current + next window
-                    floored = now_et.replace(second=0, microsecond=0)
-                    floored = floored.replace(minute=(floored.minute // minutes) * minutes)
-                    start = floored + timedelta(minutes=minutes * window_offset)
-                    end = start + timedelta(minutes=minutes)
-                    slugs.append({
-                        "slug": self._build_slug(asset, start, end),
-                        "asset": asset,
-                        "timeframe": tf_label,
-                    })
-        return slugs
-
-    def _build_slug(self, asset: str, start, end) -> str:
-        name = "bitcoin" if asset == "BTC" else "ethereum"
-        date_part = start.strftime("%B-%-d").lower()
-        return f"{name}-up-or-down-{date_part}-{self._fmt_time(start)}-{self._fmt_time(end)}-et"
-
-    def _fmt_time(self, dt) -> str:
-        """Format as '1210am', '7pm', '130pm' etc."""
-        h = dt.hour % 12 or 12
-        m = dt.minute
-        ampm = "am" if dt.hour < 12 else "pm"
-        return f"{h}{ampm}" if m == 0 else f"{h}{m:02d}{ampm}"
 
     async def get_market_orderbook(self, token_id: str) -> dict:
         """Fetch current orderbook for a token."""
