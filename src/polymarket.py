@@ -321,19 +321,26 @@ class PolymarketClient:
     async def get_trader_open_positions(self, address: str, condition_ids: list[str]) -> list[dict]:
         """
         GET https://data-api.polymarket.com/positions?user={address}
-        Check if a tracked trader currently holds shares in our markets.
+        Returns trader's current open positions, filtered to our 4 markets.
+        Response fields: conditionId, outcome, size, price, currentPrice, ...
         """
         positions = []
         try:
-            params = {"user": address.lower()}
+            params = {"user": address.lower(), "sizeThreshold": "0.01"}
             async with self.session.get(f"{DATA_API}/positions", params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     all_pos = data if isinstance(data, list) else data.get("data", [])
+                    if all_pos:
+                        logger.debug(f"Positions keys: {list(all_pos[0].keys())[:10]}")
                     for pos in all_pos:
                         cid = pos.get("conditionId") or pos.get("market") or ""
-                        if cid in condition_ids:
+                        size = float(pos.get("size") or 0)
+                        if cid in condition_ids and size > 0:
                             positions.append(pos)
+                else:
+                    body = await resp.text()
+                    logger.debug(f"Positions {resp.status} for {address[:10]}: {body[:80]}")
         except Exception as e:
             logger.error(f"Error fetching positions for {address}: {e}")
         return positions
