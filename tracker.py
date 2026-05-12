@@ -92,6 +92,14 @@ state = {
 state_lock = threading.Lock()
 
 # ─── Candle Market Detection ──────────────────────────────────────────────────
+# Confirmed series slugs for BTC/ETH 5min and 15min candle markets
+CANDLE_SERIES = [
+    {"slug": "btc-up-or-down-5m",  "asset": "BTC", "window_min": 5},
+    {"slug": "btc-up-or-down-15m", "asset": "BTC", "window_min": 15},
+    {"slug": "eth-up-or-down-5m",  "asset": "ETH", "window_min": 5},
+    {"slug": "eth-up-or-down-15m", "asset": "ETH", "window_min": 15},
+]
+
 _CANDLE_KEYWORDS = re.compile(
     r"(5.?min|15.?min|5-minute|15-minute)", re.IGNORECASE
 )
@@ -155,37 +163,67 @@ def _telegram(msg: str):
         log.warning(f"Telegram error: {e}")
 
 # ─── Step 1: Discover Active Candle Markets ───────────────────────────────────
-def discover_candle_markets():
+def discover_candle_markets() -> dict:
     """
-    Fetch open markets from Polymarket and filter to BTC/ETH 5/15min candles.
-    Uses /markets endpoint with tag-based filtering where possible.
+    Fetch open BTC/ETH 5min & 15min markets using confirmed seriesSlug filter.
+
+    Confirmed working endpoint (verified against live API):
+      GET https://gamma-api.polymarket.com/events
+          ?seriesSlug=btc-up-or-down-5m&closed=false&limit=20&order=id&ascending=false
+
+    Each event has a nested markets[] array. markets[0] contains:
+      - conditionId  → used for trades/positions lookups on data-api
+      - clobTokenIds → JSON string of [up_token_id, down_token_id]
+      - outcomes     → JSON string ["Up", "Down"]
     """
     found = {}
-    for tag in ["bitcoin", "ethereum"]:
-        data = _get(f"{DATA_API}/markets", params={
-            "tag": tag, "closed": "false", "limit": 200
+
+    for series in CANDLE_SERIES:
+        data = _get(f"{GAMMA_API}/events", params={
+            "seriesSlug": series["slug"],
+            "closed":     "false",
+            "order":      "id",
+            "ascending":  "false",
+            "limit":      10,   # only need the current/next candle(s)
         })
         if not data:
+            time.sleep(REQUEST_DELAY_S)
             continue
-        markets = data if isinstance(data, list) else data.get("data", [])
-        for m in markets:
-            title = m.get("question") or m.get("title") or ""
-            cid   = m.get("conditionId") or m.get("condition_id") or m.get("id")
+
+        events = data if isinstance(data, list) else data.get("data", [])
+        for event in events:
+            markets = event.get("markets", [])
+            if not markets:
+                continue
+            m = markets[0]   # each candle event has exactly one market
+            cid = m.get("conditionId")
             if not cid:
                 continue
-            if _is_candle_market(title):
-                found[cid] = {
-                    "conditionId": cid,
-                    "title":       title,
-                    "window_min":  _candle_window(title),
-                    "asset":       "BTC" if _BTC.search(title) else "ETH",
-                    "outcomes":    m.get("outcomes", ["YES", "NO"]),
-                    "token_ids":   m.get("clobTokenIds") or m.get("token_ids") or [],
-                    "end_date":    m.get("endDate") or m.get("end_date"),
-                }
+
+            raw_outcomes  = m.get("outcomes", '["Up","Down"]')
+            raw_token_ids = m.get("clobTokenIds", "[]")
+            if isinstance(raw_outcomes, str):
+                try:    raw_outcomes  = json.loads(raw_outcomes)
+                except: raw_outcomes  = ["Up", "Down"]
+            if isinstance(raw_token_ids, str):
+                try:    raw_token_ids = json.loads(raw_token_ids)
+                except: raw_token_ids = []
+
+            found[cid] = {
+                "conditionId": cid,
+                "title":       event.get("title") or m.get("question", ""),
+                "asset":       series["asset"],
+                "window_min":  series["window_min"],
+                "outcomes":    raw_outcomes,   # ["Up", "Down"]
+                "token_ids":   raw_token_ids,
+                "end_date":    m.get("endDate"),
+                "series_slug": series["slug"],
+            }
+
         time.sleep(REQUEST_DELAY_S)
 
-    log.info(f"Discovered {len(found)} active candle markets")
+    log.info(f"Discovered {len(found)} active candle markets "
+             f"({', '.join(s['slug'] for s in CANDLE_SERIES)})")
     return found
 
 # ─── Step 2: Pull Recent Trades Per Market ────────────────────────────────────
@@ -318,7 +356,7 @@ def scan_top_trader_positions():
         for cid, pos in positions.items():
             if cid not in active_mkts:
                 continue   # not a candle market we track
-            outcome = (pos.get("outcome") or "").upper()
+            outcome = (pos.get("outcome") or "").capitalize()  # "Up" or "Down"
             price   = pos.get("price", 0)
             if outcome and price <= MAX_ENTRY_PRICE:
                 signals[cid][outcome].append({
@@ -405,7 +443,7 @@ def _execute_buy(cid, outcome, mkt_info, size_usd, price):
             client = ClobClient(host=CLOB_HOST, chain_id=137, key=POLYMARKET_PRIVATE_KEY, creds=creds)
 
         token_ids = mkt_info.get("token_ids", [])
-        outcomes  = mkt_info.get("outcomes", ["YES", "NO"])
+        outcomes  = mkt_info.get("outcomes", ["Up", "Down"])
         try:
             token_idx = outcomes.index(outcome)
             token_id  = token_ids[token_idx]
