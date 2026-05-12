@@ -33,7 +33,7 @@ MARKET_REFRESH_S     = int(os.getenv("MARKET_REFRESH_S",     "120"))   # re-disc
 TRADER_REFRESH_S     = int(os.getenv("TRADER_REFRESH_S",     "300"))   # re-score traders
 REQUEST_DELAY_S      = float(os.getenv("REQUEST_DELAY_S",    "0.5"))
 
-MIN_CANDLE_TRADES    = int(os.getenv("MIN_CANDLE_TRADES",    "10"))    # min history to trust
+MIN_CANDLE_TRADES    = int(os.getenv("MIN_CANDLE_TRADES",    "3"))     # min history to trust
 MIN_WIN_RATE         = float(os.getenv("MIN_WIN_RATE",       "0.60"))  # 60 %
 MIN_POSITION_USD     = float(os.getenv("MIN_POSITION_USD",   "200"))
 MAX_ENTRY_PRICE      = float(os.getenv("MAX_ENTRY_PRICE",    "0.85"))
@@ -600,7 +600,29 @@ def main_loop():
         )
         time.sleep(POLL_INTERVAL_S)
 
-# ─── Telegram Bot Commands ────────────────────────────────────────────────────
+# ─── Telegram Webhook ────────────────────────────────────────────────────────
+def register_telegram_webhook():
+    """Tell Telegram to POST updates to our Railway URL instead of long-polling."""
+    domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+    if not domain or not TELEGRAM_TOKEN:
+        log.warning("Telegram webhook not registered: missing RAILWAY_PUBLIC_DOMAIN or TOKEN")
+        return
+    url = f"https://{domain}/telegram"
+    try:
+        r = _session.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook",
+            json={"url": url},
+            timeout=10,
+        )
+        result = r.json()
+        if result.get("ok"):
+            log.info(f"Telegram webhook registered: {url}")
+        else:
+            log.warning(f"Telegram webhook failed: {result}")
+    except Exception as e:
+        log.warning(f"Telegram webhook error: {e}")
+
+# Keep long-poll fallback for local dev (no RAILWAY_PUBLIC_DOMAIN set)
 def telegram_bot_loop():
     offset = None
     while True:
@@ -762,6 +784,21 @@ def api_stats():
         "top_trader_count": len(state["top_traders"]),
     })
 
+@app.route("/telegram", methods=["POST"])
+def telegram_webhook():
+    """Receive Telegram updates via webhook (used on Railway)."""
+    try:
+        from flask import request as flask_request
+        update = flask_request.get_json(force=True, silent=True) or {}
+        msg    = update.get("message", {})
+        text   = msg.get("text", "").strip()
+        chat   = str(msg.get("chat", {}).get("id", ""))
+        if text and chat == TELEGRAM_CHAT_ID:
+            _handle_command(text)
+    except Exception as e:
+        log.warning(f"Webhook handler error: {e}")
+    return "", 200   # always 200 so Telegram doesn't retry
+
 # ─── Entry point ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     log.info("PMB Candle Copy Trader starting…")
@@ -774,8 +811,13 @@ if __name__ == "__main__":
     state["_scored_markets"] = set(scored_raw)
 
     # Start background threads
-    threading.Thread(target=main_loop,         daemon=True).start()
+    threading.Thread(target=main_loop, daemon=True).start()
     if TELEGRAM_TOKEN:
-        threading.Thread(target=telegram_bot_loop, daemon=True).start()
+        if os.getenv("RAILWAY_PUBLIC_DOMAIN"):
+            # On Railway: use webhook (Telegram POSTs to /telegram)
+            threading.Thread(target=register_telegram_webhook, daemon=True).start()
+        else:
+            # Local dev: fall back to long-polling
+            threading.Thread(target=telegram_bot_loop, daemon=True).start()
 
     app.run(host="0.0.0.0", port=PORT)
