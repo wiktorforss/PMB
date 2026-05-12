@@ -72,46 +72,38 @@ class PolymarketClient:
 
     async def get_active_crypto_markets(self) -> list[dict]:
         """
-        Fetch active BTC/ETH 5min and 15min up/down markets.
+        Fetch active BTC/ETH 5min and 15min up/down markets from Gamma API.
 
-        Strategy: make separate targeted searches for each asset so we get
-        focused results rather than hoping a generic tag filter works.
-        Then apply strict word-boundary asset detection and explicit
-        timeframe detection to keep only real short-term price markets.
+        Gamma API supports: active, closed, limit, offset, tag_slug.
+        No full-text search param exists, so we page through all active markets
+        and filter client-side with strict regex matching.
+        We fetch up to 500 markets across pages to ensure good coverage.
         """
         seen_ids: set = set()
         markets = []
 
-        # Search queries that reliably surface short-term crypto price markets
-        search_terms = [
-            "btc 5 minutes",
-            "btc 15 minutes",
-            "bitcoin 5 minutes",
-            "bitcoin 15 minutes",
-            "eth 5 minutes",
-            "eth 15 minutes",
-            "ethereum 5 minutes",
-            "ethereum 15 minutes",
-            "btc above",
-            "eth above",
-            "bitcoin above",
-            "ethereum above",
-        ]
-
-        for term in search_terms:
+        # Fetch pages of active markets - Gamma API uses offset pagination
+        for offset in range(0, 500, 100):
             try:
                 params = {
                     "active": "true",
                     "closed": "false",
-                    "limit": 50,
-                    "search": term,
+                    "limit": 100,
+                    "offset": offset,
+                    "order": "volume",
+                    "ascending": "false",
                 }
                 async with self.session.get(f"{GAMMA_API}/markets", params=params) as resp:
                     if resp.status != 200:
-                        continue
+                        logger.warning(f"Gamma API page {offset}: status {resp.status}")
+                        break
                     data = await resp.json()
 
                 raw = data if isinstance(data, list) else data.get("markets", [])
+                if not raw:
+                    break  # no more pages
+
+                added_this_page = 0
                 for market in raw:
                     mid = market.get("id")
                     if not mid or mid in seen_ids:
@@ -130,6 +122,7 @@ class PolymarketClient:
                         continue
 
                     seen_ids.add(mid)
+                    added_this_page += 1
                     markets.append({
                         "id": mid,
                         "condition_id": market.get("conditionId"),
@@ -143,47 +136,19 @@ class PolymarketClient:
                         "end_date": market.get("endDate"),
                     })
 
-            except Exception as e:
-                logger.warning(f"Search '{term}' failed: {e}")
-                continue
+                logger.debug(f"Page offset={offset}: scanned {len(raw)}, matched {added_this_page}")
 
-        # Fallback: broad fetch if targeted searches returned nothing
-        if not markets:
-            logger.info("Targeted searches returned 0, trying broad fetch...")
-            try:
-                params = {"active": "true", "closed": "false", "limit": 300}
-                async with self.session.get(f"{GAMMA_API}/markets", params=params) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        raw = data if isinstance(data, list) else data.get("markets", [])
-                        for market in raw:
-                            mid = market.get("id")
-                            if not mid or mid in seen_ids:
-                                continue
-                            question = (market.get("question") or "")
-                            slug = (market.get("slug") or "")
-                            combined = (question + " " + slug).lower()
-                            asset = self._detect_asset(combined)
-                            timeframe = self._detect_timeframe(combined)
-                            if asset and timeframe != "unknown":
-                                seen_ids.add(mid)
-                                markets.append({
-                                    "id": mid,
-                                    "condition_id": market.get("conditionId"),
-                                    "question": question,
-                                    "slug": slug,
-                                    "asset": asset,
-                                    "timeframe": timeframe,
-                                    "tokens": market.get("tokens", []),
-                                    "volume": float(market.get("volume") or 0),
-                                    "liquidity": float(market.get("liquidity") or 0),
-                                    "end_date": market.get("endDate"),
-                                })
+                # If the top-volume page has 0 matches, remaining pages won't either
+                if offset == 0 and added_this_page == 0:
+                    logger.info("No matches on first page - short-term markets may not be active right now")
+                    break
+
             except Exception as e:
-                logger.error(f"Broad fetch failed: {e}")
+                logger.error(f"Market fetch page offset={offset} failed: {e}")
+                break
 
         markets.sort(key=lambda m: m["volume"], reverse=True)
-        logger.info(f"Found {len(markets)} active crypto markets")
+        logger.info(f"Found {len(markets)} active BTC/ETH short-term markets")
         return markets
 
     def _detect_asset(self, text: str) -> str:
