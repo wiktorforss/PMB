@@ -12,6 +12,11 @@ from telegram.constants import ParseMode
 
 from .bot_engine import TradingBot
 
+
+def _e(text: str) -> str:
+    """Escape special chars for Telegram HTML parse mode."""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 logger = logging.getLogger(__name__)
 
 ALLOWED_IDS = set(
@@ -119,7 +124,7 @@ class TelegramBot:
                 await self.app.bot.send_message(
                     chat_id=chat_id,
                     text=text,
-                    parse_mode=ParseMode.MARKDOWN,
+                    parse_mode=ParseMode.HTML,
                 )
             except Exception as e:
                 logger.error(f"Broadcast failed for {chat_id}: {e}")
@@ -133,7 +138,7 @@ class TelegramBot:
         bot_status = "🟢 Running" if self.trading_bot.running else "🔴 Stopped"
         copy_status = "🟢 ON" if self.trading_bot.copy_trade_enabled else "🔴 OFF"
         text = (
-            f"🤖 *Polymarket Trading Bot*\n\n"
+            f"🤖 <b>Polymarket Trading Bot</b>\n\n"
             f"Status: {bot_status}\n"
             f"Copy Trading: {copy_status}\n"
             f"Stake: ${self.trading_bot.stake_usdc:.2f} USDC\n\n"
@@ -141,14 +146,14 @@ class TelegramBot:
         )
         await update.message.reply_text(
             text,
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
             reply_markup=build_main_keyboard(self.trading_bot)
         )
 
     @auth_required
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         help_text = (
-            "📖 *Available Commands*\n\n"
+            "📖 <b>Available Commands</b>\n\n"
             "/start — Main control panel\n"
             "/stats — Performance statistics\n"
             "/positions — Open positions\n"
@@ -159,14 +164,14 @@ class TelegramBot:
             "/startbot — Start the trading bot\n"
             "/stopbot — Stop the trading bot\n"
         )
-        await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
     @auth_required
     async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         stats = await self.trading_bot.get_stats()
         pnl_emoji = "📈" if stats["total_pnl"] >= 0 else "📉"
         text = (
-            f"📊 *Bot Statistics*\n\n"
+            f"📊 <b>Bot Statistics</b>\n\n"
             f"🔓 Open Positions: {stats['open_positions']}/{self.trading_bot.max_open_positions}\n"
             f"✅ Closed Trades: {stats['closed_positions']}\n"
             f"🎯 Win Rate: {stats['win_rate']:.1%}\n\n"
@@ -177,7 +182,7 @@ class TelegramBot:
             f"💰 Stake per Trade: ${stats['stake_usdc']:.2f}\n"
             f"📋 Copy Trading: {'ON ✅' if stats['copy_trade_enabled'] else 'OFF ❌'}"
         )
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
     @auth_required
     async def cmd_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -186,19 +191,19 @@ class TelegramBot:
             await update.message.reply_text("No open positions.")
             return
 
-        lines = ["📋 *Open Positions*\n"]
+        lines = ["📋 <b>Open Positions</b>\n"]
         for p in positions:
             current = p.current_price or p.entry_price
             unrealized = (current * p.shares) - p.stake_usdc
             direction_emoji = "🟢" if p.direction == "UP" else "🔴"
             lines.append(
-                f"{direction_emoji} *{p.asset} {p.direction}* ({p.timeframe})\n"
+                f"{direction_emoji} <b>{p.asset} {p.direction}</b> ({p.timeframe})\n"
                 f"  Entry: {p.entry_price:.3f} → Now: {current:.3f}\n"
                 f"  Stake: ${p.stake_usdc:.2f} | PnL: ${unrealized:+.2f}\n"
                 f"  {'📋 Copied' if p.copied_from else '🖐 Manual'}"
             )
 
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     @auth_required
     async def cmd_traders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -209,21 +214,21 @@ class TelegramBot:
             )
             return
 
-        lines = [f"👥 *Top {len(traders)} Profitable Traders*\n"]
+        lines = [f"👥 <b>Top {len(traders)} Profitable Traders</b>\n"]
         for i, t in enumerate(traders[:10], 1):
             lines.append(
                 f"{i}. `{t.address[:8]}...{t.address[-4:]}`\n"
                 f"   WR: {t.win_rate:.1%} | Trades: {t.total_trades} | PnL: ${t.total_pnl:+.0f}"
             )
 
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     @auth_required
     async def cmd_markets(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         summary = self.trading_bot.get_markets_summary()
         await update.message.reply_text(
-            f"🏦 *Active Crypto Markets*\n\n{summary}",
-            parse_mode=ParseMode.MARKDOWN
+            f"🏦 <b>Active Crypto Markets</b>\n\n{summary}",
+            parse_mode=ParseMode.HTML
         )
 
     @auth_required
@@ -290,7 +295,7 @@ class TelegramBot:
                 stats = await self.trading_bot.get_stats()
                 pnl_emoji = "📈" if stats["total_pnl"] >= 0 else "📉"
                 lines = [
-                    "📊 *Statistics*\n",
+                    "📊 <b>Statistics</b>\n",
                     f"Open: {stats['open_positions']} | Closed: {stats['closed_positions']}",
                     f"Win Rate: {stats['win_rate']:.1%}",
                     f"{pnl_emoji} Realized: ${stats['total_pnl']:+.2f}",
@@ -298,7 +303,7 @@ class TelegramBot:
                     f"Stake: ${stats['stake_usdc']}",
                 ]
                 text = "\n".join(lines)
-                await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML,
                                               reply_markup=build_main_keyboard(self.trading_bot))
 
             elif data == "positions":
@@ -306,14 +311,14 @@ class TelegramBot:
                 if not positions:
                     text = "No open positions."
                 else:
-                    lines = [f"📋 *{len(positions)} Open Position(s)*\n"]
+                    lines = [f"📋 <b>{len(positions)} Open Position(s)</b>\n"]
                     for p in positions:
                         current = p.current_price or p.entry_price
                         pnl = (current * p.shares) - p.stake_usdc
                         emoji = "🟢" if p.direction == "UP" else "🔴"
                         lines.append(f"{emoji} {p.asset} {p.direction} | ${pnl:+.2f}")
                     text = "\n".join(lines)
-                await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML,
                                               reply_markup=build_main_keyboard(self.trading_bot))
 
             elif data == "traders":
@@ -321,17 +326,17 @@ class TelegramBot:
                 if not traders:
                     text = "No traders tracked yet."
                 else:
-                    lines = [f"👥 *{len(traders)} Tracked Traders*\n"]
+                    lines = [f"👥 <b>{len(traders)} Tracked Traders</b>\n"]
                     for t in traders[:5]:
                         lines.append(f"`{t.address[:8]}...` WR:{t.win_rate:.0%} PnL:${t.total_pnl:+.0f}")
                     text = "\n".join(lines)
-                await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML,
                                               reply_markup=build_main_keyboard(self.trading_bot))
 
             elif data == "markets":
                 summary = self.trading_bot.get_markets_summary()
-                text = ("🏦 *Markets*\n\n" + summary) if summary else "No markets loaded yet."
-                await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
+                text = ("🏦 <b>Markets</b>\n\n" + summary) if summary else "No markets loaded yet."
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML,
                                               reply_markup=build_main_keyboard(self.trading_bot))
 
             elif data == "toggle_copy":
@@ -354,13 +359,13 @@ class TelegramBot:
                 if not closed:
                     text = "No closed trades yet."
                 else:
-                    lines = ["📜 *Recent Trades*\n"]
+                    lines = ["📜 <b>Recent Trades</b>\n"]
                     for p in closed:
                         emoji = "✅" if (p.pnl_usdc or 0) > 0 else "❌"
                         lines.append(f"{emoji} {p.asset} {p.direction} ({p.timeframe})")
                         lines.append(f"   PnL: ${p.pnl_usdc:+.2f}")
                     text = "\n".join(lines)
-                await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML,
                                               reply_markup=build_main_keyboard(self.trading_bot))
 
             elif data == "start_bot":
