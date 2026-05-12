@@ -27,8 +27,8 @@ class TradingBot:
         self.stake_usdc = float(os.getenv("DEFAULT_STAKE_USDC", "5.0"))
         self.max_stake_usdc = float(os.getenv("MAX_STAKE_USDC", "50.0"))
         self.max_open_positions = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
-        self.min_win_rate = float(os.getenv("MIN_TRADER_WIN_RATE", "0.60"))
-        self.min_trader_trades = int(os.getenv("MIN_TRADER_TRADES", "20"))
+        self.min_win_rate = float(os.getenv("MIN_TRADER_WIN_RATE", "0.55"))
+        self.min_trader_trades = int(os.getenv("MIN_TRADER_TRADES", "5"))
         self.top_traders_n = int(os.getenv("TOP_TRADERS_TO_TRACK", "10"))
 
         self._active_markets: list[dict] = []
@@ -111,6 +111,9 @@ class TradingBot:
     def get_market_ids(self) -> list[str]:
         return [m["id"] for m in self._active_markets if m.get("id")]
 
+    def get_condition_ids(self) -> list[str]:
+        return [m["condition_id"] for m in self._active_markets if m.get("condition_id")]
+
     def get_markets_summary(self) -> str:
         if not self._active_markets:
             return "No active markets loaded yet."
@@ -128,13 +131,17 @@ class TradingBot:
 
     async def _scan_traders(self):
         if not self._active_markets:
+            logger.info("Trader scan skipped — no markets loaded yet")
             return
 
-        market_ids = self.get_market_ids()[:20]  # Limit to top 20 by volume
+        market_ids = self.get_market_ids()
+        condition_ids = self.get_condition_ids()
+        logger.info(f"Starting trader scan: {len(market_ids)} markets, {len(condition_ids)} conditionIds")
 
         async with PolymarketClient() as client:
             profitable = await client.get_profitable_traders(
                 market_ids=market_ids,
+                condition_ids=condition_ids,
                 min_win_rate=self.min_win_rate,
                 min_trades=self.min_trader_trades,
                 top_n=self.top_traders_n,
