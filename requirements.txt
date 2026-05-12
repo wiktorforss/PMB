@@ -1,0 +1,11 @@
+python-telegram-bot==20.7
+aiohttp==3.9.3
+asyncio==3.4.3
+py-clob-client==0.14.0
+web3==6.15.1
+python-dotenv==1.0.1
+apscheduler==3.10.4
+sqlalchemy==2.0.27
+aiosqlite==0.20.0
+eth-account==0.10.0
+requests==2.31.0
