@@ -72,114 +72,96 @@ class PolymarketClient:
 
     async def get_active_crypto_markets(self) -> list[dict]:
         """
-        Fetch active BTC/ETH 5min and 15min up/down markets from Gamma API.
+        Fetch the 4 rolling short-term markets by generating their expected slugs.
 
-        Gamma API supports: active, closed, limit, offset, tag_slug.
-        No full-text search param exists, so we page through all active markets
-        and filter client-side with strict regex matching.
-        We fetch up to 500 markets across pages to ensure good coverage.
+        Polymarket creates new markets every 5/15 minutes with slugs like:
+          bitcoin-up-or-down-may-12-1210am-1215am-et
+          ethereum-up-or-down-may-12-7pm-715pm-et
+
+        We generate the current slug for each of the 4 markets, plus the next
+        window, so we always have a market ready even near interval boundaries.
         """
-        seen_ids: set = set()
         markets = []
+        seen_ids: set = set()
 
-        # Fetch pages of active markets - Gamma API uses offset pagination
-        for offset in range(0, 500, 100):
+        for slug_info in self._get_current_slugs():
             try:
-                params = {
-                    "active": "true",
-                    "closed": "false",
-                    "limit": 100,
-                    "offset": offset,
-                    "order": "volume",
-                    "ascending": "false",
-                }
-                async with self.session.get(f"{GAMMA_API}/markets", params=params) as resp:
+                async with self.session.get(
+                    f"{GAMMA_API}/markets",
+                    params={"slug": slug_info["slug"]}
+                ) as resp:
                     if resp.status != 200:
-                        logger.warning(f"Gamma API page {offset}: status {resp.status}")
-                        break
+                        continue
                     data = await resp.json()
+                    raw = data if isinstance(data, list) else data.get("markets", [])
 
-                raw = data if isinstance(data, list) else data.get("markets", [])
-                if not raw:
-                    break  # no more pages
-
-                added_this_page = 0
-                for market in raw:
-                    mid = market.get("id")
-                    if not mid or mid in seen_ids:
-                        continue
-
-                    question = (market.get("question") or "")
-                    slug = (market.get("slug") or "")
-                    combined = (question + " " + slug).lower()
-
-                    asset = self._detect_asset(combined)
-                    if not asset:
-                        continue
-
-                    timeframe = self._detect_timeframe(combined)
-                    if timeframe == "unknown":
-                        continue
-
-                    seen_ids.add(mid)
-                    added_this_page += 1
-                    markets.append({
-                        "id": mid,
-                        "condition_id": market.get("conditionId"),
-                        "question": question,
-                        "slug": slug,
-                        "asset": asset,
-                        "timeframe": timeframe,
-                        "tokens": market.get("tokens", []),
-                        "volume": float(market.get("volume") or 0),
-                        "liquidity": float(market.get("liquidity") or 0),
-                        "end_date": market.get("endDate"),
-                    })
-
-                logger.debug(f"Page offset={offset}: scanned {len(raw)}, matched {added_this_page}")
-
-                # If the top-volume page has 0 matches, remaining pages won't either
-                if offset == 0 and added_this_page == 0:
-                    logger.info("No matches on first page - short-term markets may not be active right now")
-                    break
-
+                    for market in raw:
+                        mid = market.get("id")
+                        if not mid or mid in seen_ids:
+                            continue
+                        seen_ids.add(mid)
+                        markets.append({
+                            "id": mid,
+                            "condition_id": market.get("conditionId"),
+                            "question": market.get("question", ""),
+                            "slug": market.get("slug", ""),
+                            "asset": slug_info["asset"],
+                            "timeframe": slug_info["timeframe"],
+                            "tokens": market.get("tokens", []),
+                            "volume": float(market.get("volume") or 0),
+                            "liquidity": float(market.get("liquidity") or 0),
+                            "end_date": market.get("endDate"),
+                        })
             except Exception as e:
-                logger.error(f"Market fetch page offset={offset} failed: {e}")
-                break
+                logger.warning(f"Slug fetch failed for {slug_info['slug']}: {e}")
 
-        markets.sort(key=lambda m: m["volume"], reverse=True)
-        logger.info(f"Found {len(markets)} active BTC/ETH short-term markets")
+        if not markets:
+            tried = [s["slug"] for s in self._get_current_slugs()[:4]]
+            logger.warning(f"No markets found. Tried slugs: {tried}")
+        else:
+            logger.info(f"Found {len(markets)} active BTC/ETH short-term markets")
+
         return markets
 
-    def _detect_asset(self, text: str) -> str:
+    def _get_current_slugs(self) -> list[dict]:
         """
-        Strict asset detection using word boundaries.
-        Avoids "eth" matching "netherlands", "method", etc.
+        Generate expected slugs for BTC/ETH 5min and 15min markets.
+        Returns current window + next window for each of the 4 market types.
         """
-        import re
-        # BTC: match "btc" or "bitcoin" as whole words
-        if re.search(r"\bbtc\b|\bbitcoin\b", text):
-            return "BTC"
-        # ETH: match "eth" or "ethereum" as whole words only
-        # \b ensures we don't match "neth", "meth", "method", etc.
-        if re.search(r"\beth\b|\bethereum\b", text):
-            return "ETH"
-        return ""
+        from datetime import datetime, timezone, timedelta
 
-    def _detect_timeframe(self, text: str) -> str:
-        """
-        Detect 5-minute or 15-minute timeframes from market question/slug.
-        Requires explicit minute references to avoid false positives.
-        """
-        import re
-        # 15-minute must come before 5-minute check
-        if re.search(r"15.?min|15.?minute|15m\b", text):
-            return "15min"
-        if re.search(r"\b5.?min|\b5.?minute|\b5m\b", text):
-            return "5min"
-        if re.search(r"1.?hour|60.?min", text):
-            return "1hr"
-        return "unknown"
+        now_utc = datetime.now(timezone.utc)
+        # EDT (UTC-4) Mar-Nov, EST (UTC-5) otherwise
+        month = now_utc.month
+        et_offset = timedelta(hours=-4) if 3 <= month <= 11 else timedelta(hours=-5)
+        now_et = now_utc + et_offset
+
+        slugs = []
+        for asset in ["BTC", "ETH"]:
+            for minutes, tf_label in [(5, "5min"), (15, "15min")]:
+                for window_offset in [0, 1]:  # current + next window
+                    floored = now_et.replace(second=0, microsecond=0)
+                    floored = floored.replace(minute=(floored.minute // minutes) * minutes)
+                    start = floored + timedelta(minutes=minutes * window_offset)
+                    end = start + timedelta(minutes=minutes)
+                    slugs.append({
+                        "slug": self._build_slug(asset, start, end),
+                        "asset": asset,
+                        "timeframe": tf_label,
+                    })
+        return slugs
+
+    def _build_slug(self, asset: str, start, end) -> str:
+        name = "bitcoin" if asset == "BTC" else "ethereum"
+        date_part = start.strftime("%B-%-d").lower()
+        return f"{name}-up-or-down-{date_part}-{self._fmt_time(start)}-{self._fmt_time(end)}-et"
+
+    def _fmt_time(self, dt) -> str:
+        """Format as '1210am', '7pm', '130pm' etc."""
+        h = dt.hour % 12 or 12
+        m = dt.minute
+        ampm = "am" if dt.hour < 12 else "pm"
+        return f"{h}{ampm}" if m == 0 else f"{h}{m:02d}{ampm}"
 
     async def get_market_orderbook(self, token_id: str) -> dict:
         """Fetch current orderbook for a token."""
