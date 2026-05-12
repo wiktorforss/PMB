@@ -57,10 +57,10 @@ class PolymarketClient:
                 )
                 self._clob_client = ClobClient(
                     host=CLOB_API,
-                    chain_id=137,  # Polygon
+                    chain_id=137,       # Polygon PoS
                     key=self.private_key,
                     creds=creds,
-                    signature_type=2,  # POLY_GNOSIS_SAFE
+                    signature_type=0,   # EOA (standard wallet)
                 )
             except Exception as e:
                 logger.error(f"Failed to init CLOB client: {e}")
@@ -316,11 +316,13 @@ class PolymarketClient:
             from py_clob_client.order_builder.constants import BUY, SELL
 
             clob_side = BUY if side == "BUY" else SELL
-            shares = amount_usdc / price if price > 0 else 0
 
             order_args = MarketOrderArgs(
                 token_id=token_id,
                 amount=amount_usdc,
+                side=clob_side,
+                price=price,
+                order_type=OrderType.FOK,
             )
             signed_order = client.create_market_order(order_args)
             response = client.post_order(signed_order, OrderType.FOK)
@@ -338,8 +340,12 @@ class PolymarketClient:
         try:
             client = self._get_clob_client()
             if client:
-                balance = client.get_balance()
-                return float(balance) / 1e6  # Convert from micro-USDC
+                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                result = client.get_balance_allowance(params)
+                # Returns balance in USDC (6 decimals on Polygon)
+                raw = result.get("balance", 0)
+                return float(raw) / 1e6
         except Exception as e:
             logger.error(f"Balance check failed: {e}")
         return 0.0
