@@ -188,7 +188,7 @@ class TradingBot:
             logger.info(f"Max positions ({self.max_open_positions}) reached, skipping copy")
             return
 
-        market_ids = self.get_market_ids()
+        condition_ids = self.get_condition_ids()
 
         async with PolymarketClient() as client:
             for trader in traders:
@@ -196,71 +196,91 @@ class TradingBot:
                     break
 
                 positions = await client.get_trader_open_positions(
-                    trader["address"], market_ids
+                    trader["address"], condition_ids
                 )
-                for pos in positions:
-                    market_id = pos.get("market")
-                    outcome = pos.get("outcome")
-                    price = float(pos.get("price", 0))
-                    size = float(pos.get("size", 0))
+                logger.debug(f"Trader {trader['address'][:10]}... has {len(positions)} open positions in our markets")
 
-                    if not market_id or not outcome or price <= 0:
+                for pos in positions:
+                    # Data API positions use conditionId
+                    condition_id = pos.get("conditionId") or pos.get("market") or ""
+                    outcome = pos.get("outcome") or ""  # "Up" or "Down"
+                    price = float(pos.get("price") or pos.get("currentPrice") or 0)
+                    size = float(pos.get("size") or 0)
+
+                    if not condition_id or not outcome or price <= 0 or size <= 0:
                         continue
 
-                    # Check if we already copied this
+                    # Find matching market by conditionId
+                    market_info = next(
+                        (m for m in self._active_markets if m.get("condition_id") == condition_id), None
+                    )
+                    if not market_info:
+                        logger.debug(f"conditionId {condition_id[:16]}... not in active markets")
+                        continue
+
+                    # Check if we already have an open copy of this position
                     already_copied = await self._already_copied(
-                        trader["address"], market_id, outcome
+                        trader["address"], condition_id, outcome
                     )
                     if already_copied:
                         continue
 
-                    # Find market info
-                    market_info = next(
-                        (m for m in self._active_markets if m["id"] == market_id), None
-                    )
-                    if not market_info:
-                        continue
-
-                    # Find the token ID for this outcome
+                    # Map outcome to token_id
+                    # Tokens are {"outcome": "Up", "token_id": "..."} or {"outcome": "Yes", ...}
                     token_id = self._get_token_id(market_info, outcome)
                     if not token_id:
+                        # Log what tokens are available to help debug
+                        available = [(t.get("outcome"), t.get("token_id","")[:12]) for t in market_info.get("tokens", [])]
+                        logger.warning(f"No token_id for outcome '{outcome}' in {market_info['asset']} {market_info['timeframe']}. Available: {available}")
                         continue
 
-                    # Place the copy trade
+                    # Get current best price from orderbook
+                    current_price = await client.get_market_price(token_id)
+                    trade_price = current_price or price
+                    if not trade_price or trade_price <= 0 or trade_price >= 1:
+                        logger.warning(f"Skipping trade: invalid price {trade_price}")
+                        continue
+
+                    # Direction = outcome name for these markets (Up/Down)
+                    direction = outcome.upper()  # "UP" or "DOWN"
+
+                    logger.info(
+                        f"Placing copy trade: {market_info['asset']} {direction} "
+                        f"@ {trade_price:.3f} | ${self.stake_usdc} USDC | "
+                        f"copying {trader['address'][:10]}... (WR:{trader['win_rate']:.0%})"
+                    )
+
                     order_id = await client.place_market_order(
                         token_id=token_id,
                         side="BUY",
                         amount_usdc=self.stake_usdc,
-                        price=price,
+                        price=trade_price,
                     )
 
-                    shares = self.stake_usdc / price if price > 0 else 0
-                    direction = "UP" if "higher" in (market_info.get("question") or "").lower() else "DOWN"
-
+                    shares = self.stake_usdc / trade_price if trade_price > 0 else 0
                     await self._record_position(
                         market_info=market_info,
                         outcome=outcome,
                         direction=direction,
                         stake=self.stake_usdc,
                         shares=shares,
-                        price=price,
+                        price=trade_price,
                         order_id=order_id,
                         copied_from=trader["address"],
                     )
 
                     if order_id:
                         open_count += 1
-                        logger.info(
-                            f"✅ Copied trade: {market_info['asset']} {direction} "
-                            f"from {trader['address'][:8]}... | ${self.stake_usdc}"
-                        )
+                        logger.info(f"✅ Order placed: {order_id}")
                         await self._notify(
-                            f"📋 *Copy Trade Executed*\n"
-                            f"Market: {market_info['question'][:50]}...\n"
-                            f"Direction: {direction} | Stake: ${self.stake_usdc}\n"
-                            f"Copied from: `{trader['address'][:10]}...`\n"
-                            f"Win Rate: {trader['win_rate']:.1%}"
+                            f"📋 <b>Copy Trade Executed</b>\n"
+                            f"{market_info['asset']} {direction} ({market_info['timeframe']})\n"
+                            f"Price: {trade_price:.3f} | Stake: ${self.stake_usdc:.2f}\n"
+                            f"Copying: {trader['address'][:10]}... (WR: {trader['win_rate']:.0%})\n"
+                            f"Order: {str(order_id)[:16]}..."
                         )
+                    else:
+                        logger.warning(f"Order placement returned no ID — check CLOB credentials")
 
     def _get_token_id(self, market_info: dict, outcome: str) -> Optional[str]:
         tokens = market_info.get("tokens", [])
@@ -269,12 +289,13 @@ class TradingBot:
                 return token.get("token_id")
         return None
 
-    async def _already_copied(self, trader_addr: str, market_id: str, outcome: str) -> bool:
+    async def _already_copied(self, trader_addr: str, condition_id: str, outcome: str) -> bool:
+        """Check if we already have an open copy of this trader's position in this market."""
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(Position).where(
                     Position.copied_from == trader_addr,
-                    Position.market_id == market_id,
+                    Position.market_id == condition_id,
                     Position.outcome == outcome,
                     Position.status == "OPEN",
                 )
@@ -319,7 +340,8 @@ class TradingBot:
         async with PolymarketClient() as client:
             for pos in positions:
                 market = next(
-                    (m for m in self._active_markets if m["id"] == pos.market_id), None
+                    (m for m in self._active_markets
+                     if m.get("condition_id") == pos.market_id or m.get("id") == pos.market_id), None
                 )
                 if not market:
                     continue
@@ -351,11 +373,11 @@ class TradingBot:
                         await session.commit()
 
                     emoji = "✅" if pnl > 0 else "❌"
+                    sign = "+" if pnl > 0 else ""
                     await self._notify(
-                        f"{emoji} *Position Closed*\n"
+                        f"{emoji} <b>Position Closed</b>\n"
                         f"{pos.asset} {pos.direction} ({pos.timeframe})\n"
-                        f"PnL: {'+'if pnl>0 else ''}{pnl:.2f} USDC\n"
-                        f"({'+' if pnl>0 else ''}{(pnl/pos.stake_usdc*100):.1f}%)"
+                        f"PnL: {sign}{pnl:.2f} USDC ({sign}{(pnl/pos.stake_usdc*100):.1f}%)"
                     )
                 else:
                     # Update current price
