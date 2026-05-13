@@ -179,24 +179,34 @@ class TradingBot:
                     logger.info("Max positions reached, skipping copy")
                     break
 
+                logger.info(f"  ➡️ BUY from tracked trader — checking market/outcome/price...")
+
                 # Find which market this trade is in
                 condition_id = trade.get("conditionId") or ""
                 market_info = next(
                     (m for m in self._active_markets if m.get("condition_id") == condition_id), None
                 )
                 if not market_info:
+                    logger.warning(f"  ❌ conditionId {condition_id[:16]}... not in active markets")
+                    logger.warning(f"     Active conditionIds: {[m.get('condition_id','')[:16] for m in self._active_markets]}")
                     continue
 
+                logger.info(f"  ✅ Market found: {market_info['asset']} {market_info['timeframe']}")
+
                 # Get outcome from the asset field — for these markets asset IS the token_id
-                # We need to figure out if this is Up or Down token
                 asset_id = trade.get("asset") or ""
                 outcome, token_id = self._resolve_outcome_from_asset(market_info, asset_id)
                 if not outcome or not token_id:
+                    tokens = [(t.get("outcome"), t.get("token_id","")[:16]) for t in market_info.get("tokens", [])]
+                    logger.warning(f"  ❌ asset {asset_id[:16]}... not matched. Market tokens: {tokens}")
                     continue
+
+                logger.info(f"  ✅ Outcome: {outcome} | token: {token_id[:16]}...")
 
                 # Check we haven't already copied this trader in this market window
                 already = await self._already_copied(trader_addr, condition_id, outcome)
                 if already:
+                    logger.info(f"  ⏭️ Already copied this position, skipping")
                     continue
 
                 # Get trader info for logging
