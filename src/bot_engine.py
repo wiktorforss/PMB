@@ -149,10 +149,16 @@ class TradingBot:
 
         self._tracked_traders = profitable
         await self._upsert_traders(profitable)
-        logger.info(f"Tracking {len(profitable)} profitable traders")
+        logger.info(
+            f"Tracking {len(profitable)} profitable traders | "
+            f"Copy trading: {'ENABLED ✅' if self.copy_trade_enabled else 'DISABLED ❌ (use /toggle to enable)'}"
+        )
 
         if self.copy_trade_enabled:
+            logger.info("Checking tracked traders for open positions to copy...")
             await self._copy_trader_positions(profitable)
+        else:
+            logger.info("Copy trading disabled — skipping position check")
 
     async def _upsert_traders(self, traders: list[dict]):
         async with AsyncSessionLocal() as session:
@@ -274,13 +280,19 @@ class TradingBot:
                         logger.info(f"✅ Order placed: {order_id}")
                         await self._notify(
                             f"📋 <b>Copy Trade Executed</b>\n"
-                            f"{market_info['asset']} {direction} ({market_info['timeframe']})\n"
-                            f"Price: {trade_price:.3f} | Stake: ${self.stake_usdc:.2f}\n"
-                            f"Copying: {trader['address'][:10]}... (WR: {trader['win_rate']:.0%})\n"
-                            f"Order: {str(order_id)[:16]}..."
+                            f"Market: {market_info['asset']} {direction} ({market_info['timeframe']})\n"
+                            f"Price: {trade_price:.3f} | Stake: ${self.stake_usdc:.2f} USDC\n"
+                            f"Shares: ~{shares:.1f}\n"
+                            f"Copying: <code>{trader['address'][:12]}...</code> (WR: {trader['win_rate']:.0%})\n"
+                            f"Order ID: <code>{str(order_id)[:20]}</code>"
                         )
                     else:
-                        logger.warning(f"Order placement returned no ID — check CLOB credentials")
+                        logger.warning("Order placement returned no ID — check CLOB credentials")
+                        await self._notify(
+                            f"⚠️ <b>Copy Trade Failed</b>\n"
+                            f"{market_info['asset']} {direction} ({market_info['timeframe']})\n"
+                            f"Order placement returned no ID. Check CLOB API credentials."
+                        )
 
     def _get_token_id(self, market_info: dict, outcome: str) -> Optional[str]:
         tokens = market_info.get("tokens", [])
