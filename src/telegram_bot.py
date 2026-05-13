@@ -216,12 +216,17 @@ class TelegramBot:
 
         lines = [f"👥 <b>Top {len(traders)} Profitable Traders</b>\n"]
         for i, t in enumerate(traders[:10], 1):
+            profile_url = f"https://polymarket.com/profile/{t.address}"
             lines.append(
-                f"{i}. `{t.address[:8]}...{t.address[-4:]}`\n"
+                f"{i}. <a href=\"{profile_url}\">{t.address[:8]}...{t.address[-4:]}</a>\n"
                 f"   WR: {t.win_rate:.1%} | Trades: {t.total_trades} | PnL: ${t.total_pnl:+.0f}"
             )
 
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
 
     @auth_required
     async def cmd_markets(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -327,11 +332,19 @@ class TelegramBot:
                     text = "No traders tracked yet."
                 else:
                     lines = [f"👥 <b>{len(traders)} Tracked Traders</b>\n"]
-                    for t in traders[:5]:
-                        lines.append(f"`{t.address[:8]}...` WR:{t.win_rate:.0%} PnL:${t.total_pnl:+.0f}")
+                    for i, t in enumerate(traders[:8], 1):
+                        profile_url = f"https://polymarket.com/profile/{t.address}"
+                        lines.append(
+                            f"{i}. <a href=\"{profile_url}\">{t.address[:8]}...{t.address[-4:]}</a>\n"
+                            f"   WR: {t.win_rate:.1%} | Trades: {t.total_trades} | PnL: ${t.total_pnl:+.0f}"
+                        )
                     text = "\n".join(lines)
-                await query.edit_message_text(text, parse_mode=ParseMode.HTML,
-                                              reply_markup=build_main_keyboard(self.trading_bot))
+                await query.edit_message_text(
+                    text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=build_main_keyboard(self.trading_bot),
+                    disable_web_page_preview=True
+                )
 
             elif data == "markets":
                 summary = self.trading_bot.get_markets_summary()
