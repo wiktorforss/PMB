@@ -119,6 +119,17 @@ class PolymarketClient:
                             if not mid or mid in seen_ids:
                                 continue
                             seen_ids.add(mid)
+
+                            # Build tokens list from whatever field the API uses.
+                            # Gamma events API uses clobTokenIds (list of token ID strings)
+                            # paired with outcomes (list of outcome names e.g. ["Up","Down"])
+                            tokens = self._parse_tokens(market)
+                            if not tokens:
+                                logger.warning(
+                                    f"No tokens found for {slug} — "
+                                    f"market keys: {list(market.keys())[:12]}"
+                                )
+
                             markets.append({
                                 "id": mid,
                                 "condition_id": market.get("conditionId"),
@@ -126,7 +137,7 @@ class PolymarketClient:
                                 "slug": slug,
                                 "asset": asset,
                                 "timeframe": timeframe,
-                                "tokens": market.get("tokens", []),
+                                "tokens": tokens,
                                 "volume": float(event.get("volume") or 0),
                                 "liquidity": float(event.get("liquidity") or 0),
                                 "end_date": market.get("endDate"),
@@ -140,6 +151,52 @@ class PolymarketClient:
             logger.warning(f"No markets found — tried slugs like btc-updown-5m-{w5}")
 
         return markets
+
+    def _parse_tokens(self, market: dict) -> list[dict]:
+        """
+        Extract token list from a market object regardless of API field naming.
+        Returns [{"outcome": "Up", "token_id": "123..."}, {"outcome": "Down", "token_id": "456..."}]
+
+        Gamma API uses:
+          - clobTokenIds: ["tokenId1", "tokenId2"]
+          - outcomes: ["Up", "Down"]  (or outcomePrices as JSON)
+        Some endpoints use:
+          - tokens: [{"outcome": "Up", "token_id": "..."}]
+        """
+        import json as _json
+
+        # Try structured tokens list first (CLOB API format)
+        raw_tokens = market.get("tokens") or []
+        if raw_tokens and isinstance(raw_tokens[0], dict) and raw_tokens[0].get("token_id"):
+            return raw_tokens
+
+        # Gamma events API format: clobTokenIds + outcomes
+        clob_ids = market.get("clobTokenIds") or []
+        outcomes_raw = market.get("outcomes") or "[]"
+        if isinstance(outcomes_raw, str):
+            try:
+                outcomes = _json.loads(outcomes_raw)
+            except Exception:
+                outcomes = []
+        else:
+            outcomes = list(outcomes_raw)
+
+        if clob_ids and outcomes and len(clob_ids) == len(outcomes):
+            return [
+                {"outcome": outcomes[i], "token_id": clob_ids[i]}
+                for i in range(len(clob_ids))
+            ]
+
+        # Fallback: try outcomePrices paired with outcomes
+        if clob_ids and len(clob_ids) >= 2:
+            # Default to Up/Down for these markets
+            names = outcomes if len(outcomes) >= 2 else ["Up", "Down"]
+            return [
+                {"outcome": names[i], "token_id": clob_ids[i]}
+                for i in range(min(len(clob_ids), len(names)))
+            ]
+
+        return []
 
     async def get_market_orderbook(self, token_id: str) -> dict:
         """Fetch current orderbook for a token."""
