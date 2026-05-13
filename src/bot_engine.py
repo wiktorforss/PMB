@@ -107,13 +107,27 @@ class TradingBot:
         logger.info("🔍 Copy watcher started (polling every 5s)")
 
         seen_tx: set[str] = set()
-        # Pre-fill seen_tx with existing trades so we don't copy historical ones
         seen_tx = await self._init_seen_trades()
+        last_new = asyncio.get_event_loop().time()
+        quiet_warned = False
 
         while self.running:
             try:
                 if self.copy_trade_enabled and self._tracked_traders:
-                    await self._check_new_trades(seen_tx)
+                    had_new = await self._check_new_trades(seen_tx)
+                    if had_new:
+                        last_new = asyncio.get_event_loop().time()
+                        quiet_warned = False
+                    elif not quiet_warned:
+                        quiet_secs = asyncio.get_event_loop().time() - last_new
+                        if quiet_secs > 300:
+                            logger.warning(f"⚠️ No new market trades for {quiet_secs/60:.0f}m — market is quiet")
+                            await self._notify(
+                                f"⚠️ <b>Markets Quiet</b>\n"
+                                f"No new trades for {quiet_secs/60:.0f} minutes.\n"
+                                f"Likely low volume period. Bot is standing by."
+                            )
+                            quiet_warned = True
             except Exception as e:
                 logger.error(f"Copy watcher error: {e}", exc_info=True)
             await asyncio.sleep(5)
@@ -163,10 +177,10 @@ class TradingBot:
             logger.error(f"Error initialising seen trades: {e}")
         return seen
 
-    async def _check_new_trades(self, seen_tx: set):
+    async def _check_new_trades(self, seen_tx: set) -> bool:
         """
         Fetch latest trades for our markets. For each new BUY by a tracked trader,
-        immediately place a copy order.
+        immediately place a copy order. Returns True if any new trades were found.
         """
         condition_ids = self.get_condition_ids()
         if not condition_ids:
@@ -179,19 +193,14 @@ class TradingBot:
             trades = await client.get_market_trades(condition_ids[:4], limit=200)
 
             new_trades = [t for t in trades if self._trade_key(t) not in seen_tx]
-            prev_seen = len(seen_tx)
+            found_new = bool(new_trades)
 
-            # Always log so we know if detection is working
-            logger.info(
-                f"Watcher poll: {len(trades)} trades fetched, "
-                f"{len(new_trades)} new, {prev_seen} already seen | "
-                f"tracking {len(tracked_addrs)} wallets"
-            )
             if new_trades:
+                logger.info(f"Watcher: {len(new_trades)} new trades | tracking {len(tracked_addrs)} wallets")
                 sample = list({t.get("proxyWallet","").lower() for t in new_trades[:30]})[:4]
                 tracked_s = list(tracked_addrs)[:3]
-                logger.info(f"  New wallets sample:     {[a[:10] for a in sample]}")
-                logger.info(f"  Tracked wallets sample: {[a[:10] for a in tracked_s]}")
+                logger.info(f"  New wallets:     {[a[:10] for a in sample]}")
+                logger.info(f"  Tracked wallets: {[a[:10] for a in tracked_s]}")
 
             for trade in trades:
                 key = self._trade_key(trade)
@@ -297,6 +306,8 @@ class TradingBot:
                         f"{market_info['asset']} {direction} — order returned no ID\n"
                         f"Check CLOB credentials in Railway env vars."
                     )
+
+        return found_new
 
     async def _position_monitor_loop(self):
         """Monitor open positions and update PnL."""
