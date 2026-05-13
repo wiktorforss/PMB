@@ -120,10 +120,17 @@ class TradingBot:
 
     def _trade_key(self, trade: dict) -> str:
         """
-        Unique identifier for a trade. The API has no transactionHash in the
-        list endpoint, so we use timestamp + wallet + asset as a composite key.
+        Unique identifier for a trade.
+        Include size+price to handle multiple trades in the same second by the same wallet.
         """
-        return f"{trade.get('timestamp','')}:{trade.get('proxyWallet','')}:{trade.get('asset','')}:{trade.get('side','')}"
+        return (
+            f"{trade.get('timestamp','')}:"
+            f"{trade.get('proxyWallet','')}:"
+            f"{trade.get('asset','')}:"
+            f"{trade.get('side','')}:"
+            f"{trade.get('size','')}:"
+            f"{trade.get('price','')}"
+        )
 
     async def _init_seen_trades(self) -> set:
         """
@@ -169,17 +176,22 @@ class TradingBot:
         open_count = await self._count_open_positions()
 
         async with PolymarketClient() as client:
-            # Fetch last 200 trades — more coverage per poll cycle
             trades = await client.get_market_trades(condition_ids[:4], limit=200)
 
             new_trades = [t for t in trades if self._trade_key(t) not in seen_tx]
+            prev_seen = len(seen_tx)
+
+            # Always log so we know if detection is working
+            logger.info(
+                f"Watcher poll: {len(trades)} trades fetched, "
+                f"{len(new_trades)} new, {prev_seen} already seen | "
+                f"tracking {len(tracked_addrs)} wallets"
+            )
             if new_trades:
-                logger.info(f"Watcher: {len(new_trades)} new trades | tracked wallets: {len(tracked_addrs)}")
-                # Log a sample of new trader addresses so we can compare with tracked
-                sample_addrs = list({t.get("proxyWallet","").lower() for t in new_trades[:20]})[:5]
-                tracked_sample = list(tracked_addrs)[:3]
-                logger.info(f"  New trade wallets sample: {[a[:10] for a in sample_addrs]}")
-                logger.info(f"  Tracked wallets sample:   {[a[:10] for a in tracked_sample]}")
+                sample = list({t.get("proxyWallet","").lower() for t in new_trades[:30]})[:4]
+                tracked_s = list(tracked_addrs)[:3]
+                logger.info(f"  New wallets sample:     {[a[:10] for a in sample]}")
+                logger.info(f"  Tracked wallets sample: {[a[:10] for a in tracked_s]}")
 
             for trade in trades:
                 key = self._trade_key(trade)
