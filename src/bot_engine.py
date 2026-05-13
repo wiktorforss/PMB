@@ -118,6 +118,13 @@ class TradingBot:
                 logger.error(f"Copy watcher error: {e}", exc_info=True)
             await asyncio.sleep(5)
 
+    def _trade_key(self, trade: dict) -> str:
+        """
+        Unique identifier for a trade. The API has no transactionHash in the
+        list endpoint, so we use timestamp + wallet + asset as a composite key.
+        """
+        return f"{trade.get('timestamp','')}:{trade.get('proxyWallet','')}:{trade.get('asset','')}:{trade.get('side','')}"
+
     async def _init_seen_trades(self) -> set:
         """Fetch current trades to use as baseline — we only copy NEW trades after startup."""
         seen = set()
@@ -128,9 +135,7 @@ class TradingBot:
             async with PolymarketClient() as client:
                 trades = await client.get_market_trades(condition_ids[:4])
                 for t in trades:
-                    tx = t.get("transactionHash") or t.get("id") or ""
-                    if tx:
-                        seen.add(tx)
+                    seen.add(self._trade_key(t))
             logger.info(f"Copy watcher baseline: {len(seen)} existing trades (will skip these)")
         except Exception as e:
             logger.error(f"Error initialising seen trades: {e}")
@@ -149,21 +154,24 @@ class TradingBot:
         open_count = await self._count_open_positions()
 
         async with PolymarketClient() as client:
-            # Only fetch the most recent 50 trades — we're polling every 5s
             trades = await client.get_market_trades(condition_ids[:4], limit=50)
 
             for trade in trades:
-                tx = trade.get("transactionHash") or trade.get("id") or ""
-                if not tx or tx in seen_tx:
+                key = self._trade_key(trade)
+                if key in seen_tx:
                     continue
-                seen_tx.add(tx)  # Mark as seen regardless of whether we copy
+                seen_tx.add(key)  # Mark as seen regardless of whether we copy
 
-                # Only copy BUYs from tracked traders
                 side = (trade.get("side") or "").upper()
+                trader_addr = (trade.get("proxyWallet") or "").lower()
+
+                # Log when we see a tracked trader (any side) so we know matching works
+                if trader_addr in tracked_addrs:
+                    logger.info(f"👀 Tracked trader seen: {trader_addr[:10]}... {side} in {trade.get('conditionId','')[:12]}...")
+
                 if side != "BUY":
                     continue
 
-                trader_addr = (trade.get("proxyWallet") or "").lower()
                 if trader_addr not in tracked_addrs:
                     continue
 
