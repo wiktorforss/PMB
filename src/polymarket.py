@@ -45,7 +45,19 @@ class PolymarketClient:
             await self.session.close()
 
     def _get_clob_client(self):
-        """Lazy-init the CLOB client for order placement."""
+        """
+        Lazy-init the CLOB client for order placement.
+
+        Signature types:
+          0 = EOA           — standalone wallet, you pay your own gas
+          1 = POLY_PROXY    — existing Polymarket proxy wallet (most common for existing users)
+          2 = GNOSIS_SAFE   — Safe multisig wallet
+          3 = POLY_1271     — new deposit wallet flow (new API users)
+
+        Set POLYMARKET_SIGNATURE_TYPE in Railway env vars to match your wallet.
+        Default is 1 (POLY_PROXY) which works for most Polymarket accounts.
+        If you get order_version_mismatch, try 0 or 3.
+        """
         if self._clob_client is None:
             try:
                 from py_clob_client.client import ClobClient
@@ -55,12 +67,16 @@ class PolymarketClient:
                     api_secret=self.api_secret,
                     api_passphrase=self.passphrase,
                 )
+                sig_type = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "1"))
+                funder = os.getenv("POLYMARKET_FUNDER_ADDRESS") or self.wallet_address
+                logger.info(f"Initialising CLOB client: signature_type={sig_type} funder={funder[:10]}...")
                 self._clob_client = ClobClient(
                     host=CLOB_API,
-                    chain_id=137,       # Polygon PoS
+                    chain_id=137,
                     key=self.private_key,
                     creds=creds,
-                    signature_type=0,   # EOA (standard wallet)
+                    signature_type=sig_type,
+                    funder=funder,
                 )
             except Exception as e:
                 logger.error(f"Failed to init CLOB client: {e}")
