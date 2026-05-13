@@ -124,10 +124,14 @@ class PolymarketClient:
                             # Gamma events API uses clobTokenIds (list of token ID strings)
                             # paired with outcomes (list of outcome names e.g. ["Up","Down"])
                             tokens = self._parse_tokens(market)
-                            if not tokens:
+                            if tokens:
+                                logger.info(f"Tokens for {slug}: {[(t['outcome'], t['token_id'][:12]) for t in tokens]}")
+                            else:
                                 logger.warning(
-                                    f"No tokens found for {slug} — "
-                                    f"market keys: {list(market.keys())[:12]}"
+                                    f"No tokens for {slug} — "
+                                    f"keys: {list(market.keys())[:12]}, "
+                                    f"clobTokenIds={str(market.get('clobTokenIds',''))[:40]}, "
+                                    f"outcomes={str(market.get('outcomes',''))[:30]}"
                                 )
 
                             markets.append({
@@ -154,45 +158,46 @@ class PolymarketClient:
 
     def _parse_tokens(self, market: dict) -> list[dict]:
         """
-        Extract token list from a market object regardless of API field naming.
+        Extract token list from a market object.
+        Gamma events API stores both clobTokenIds and outcomes as JSON strings.
         Returns [{"outcome": "Up", "token_id": "123..."}, {"outcome": "Down", "token_id": "456..."}]
-
-        Gamma API uses:
-          - clobTokenIds: ["tokenId1", "tokenId2"]
-          - outcomes: ["Up", "Down"]  (or outcomePrices as JSON)
-        Some endpoints use:
-          - tokens: [{"outcome": "Up", "token_id": "..."}]
         """
         import json as _json
 
-        # Try structured tokens list first (CLOB API format)
-        raw_tokens = market.get("tokens") or []
-        if raw_tokens and isinstance(raw_tokens[0], dict) and raw_tokens[0].get("token_id"):
-            return raw_tokens
+        def parse_field(val):
+            """Parse a field that may be a JSON string or already a list."""
+            if isinstance(val, list):
+                return val
+            if isinstance(val, str):
+                try:
+                    parsed = _json.loads(val)
+                    return parsed if isinstance(parsed, list) else []
+                except Exception:
+                    return []
+            return []
 
-        # Gamma events API format: clobTokenIds + outcomes
-        clob_ids = market.get("clobTokenIds") or []
-        outcomes_raw = market.get("outcomes") or "[]"
-        if isinstance(outcomes_raw, str):
-            try:
-                outcomes = _json.loads(outcomes_raw)
-            except Exception:
-                outcomes = []
-        else:
-            outcomes = list(outcomes_raw)
+        # Try structured tokens list first (some CLOB endpoints)
+        raw_tokens = market.get("tokens") or []
+        raw_tokens = parse_field(raw_tokens) if isinstance(raw_tokens, str) else raw_tokens
+        if raw_tokens and isinstance(raw_tokens, list) and len(raw_tokens) > 0:
+            if isinstance(raw_tokens[0], dict) and raw_tokens[0].get("token_id"):
+                return raw_tokens
+
+        # Gamma events API: clobTokenIds and outcomes are BOTH JSON strings
+        clob_ids = parse_field(market.get("clobTokenIds") or "[]")
+        outcomes = parse_field(market.get("outcomes") or "[]")
 
         if clob_ids and outcomes and len(clob_ids) == len(outcomes):
             return [
-                {"outcome": outcomes[i], "token_id": clob_ids[i]}
+                {"outcome": str(outcomes[i]), "token_id": str(clob_ids[i])}
                 for i in range(len(clob_ids))
             ]
 
-        # Fallback: try outcomePrices paired with outcomes
+        # Fallback: if we have token IDs but no outcome names, use Up/Down
         if clob_ids and len(clob_ids) >= 2:
-            # Default to Up/Down for these markets
             names = outcomes if len(outcomes) >= 2 else ["Up", "Down"]
             return [
-                {"outcome": names[i], "token_id": clob_ids[i]}
+                {"outcome": str(names[i]), "token_id": str(clob_ids[i])}
                 for i in range(min(len(clob_ids), len(names)))
             ]
 
