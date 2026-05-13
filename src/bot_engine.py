@@ -126,17 +126,32 @@ class TradingBot:
         return f"{trade.get('timestamp','')}:{trade.get('proxyWallet','')}:{trade.get('asset','')}:{trade.get('side','')}"
 
     async def _init_seen_trades(self) -> set:
-        """Fetch current trades to use as baseline — we only copy NEW trades after startup."""
+        """
+        Fetch recent trades as baseline so we don't copy historical ones on startup.
+        We only fetch the last 2 minutes worth (approx 50 trades) so we don't
+        create a large blind spot — trades older than ~2 min are irrelevant since
+        5-min markets resolve so quickly.
+        """
+        import time as _time
         seen = set()
+        cutoff = int(_time.time()) - 120  # 2 minutes ago
         try:
             condition_ids = self.get_condition_ids()
             if not condition_ids:
                 return seen
             async with PolymarketClient() as client:
-                trades = await client.get_market_trades(condition_ids[:4])
+                trades = await client.get_market_trades(condition_ids[:4], limit=200)
+                skipped = 0
                 for t in trades:
-                    seen.add(self._trade_key(t))
-            logger.info(f"Copy watcher baseline: {len(seen)} existing trades (will skip these)")
+                    ts = int(t.get("timestamp") or 0)
+                    if ts >= cutoff:  # Only mark recent trades as seen
+                        seen.add(self._trade_key(t))
+                    else:
+                        skipped += 1
+            logger.info(
+                f"Copy watcher baseline: {len(seen)} recent trades marked seen "
+                f"({skipped} older trades ignored — will re-check those)"
+            )
         except Exception as e:
             logger.error(f"Error initialising seen trades: {e}")
         return seen
@@ -154,18 +169,27 @@ class TradingBot:
         open_count = await self._count_open_positions()
 
         async with PolymarketClient() as client:
-            trades = await client.get_market_trades(condition_ids[:4], limit=50)
+            # Fetch last 200 trades — more coverage per poll cycle
+            trades = await client.get_market_trades(condition_ids[:4], limit=200)
+
+            new_trades = [t for t in trades if self._trade_key(t) not in seen_tx]
+            if new_trades:
+                logger.info(f"Watcher: {len(new_trades)} new trades | tracked wallets: {len(tracked_addrs)}")
+                # Log a sample of new trader addresses so we can compare with tracked
+                sample_addrs = list({t.get("proxyWallet","").lower() for t in new_trades[:20]})[:5]
+                tracked_sample = list(tracked_addrs)[:3]
+                logger.info(f"  New trade wallets sample: {[a[:10] for a in sample_addrs]}")
+                logger.info(f"  Tracked wallets sample:   {[a[:10] for a in tracked_sample]}")
 
             for trade in trades:
                 key = self._trade_key(trade)
                 if key in seen_tx:
                     continue
-                seen_tx.add(key)  # Mark as seen regardless of whether we copy
+                seen_tx.add(key)
 
                 side = (trade.get("side") or "").upper()
                 trader_addr = (trade.get("proxyWallet") or "").lower()
 
-                # Log when we see a tracked trader (any side) so we know matching works
                 if trader_addr in tracked_addrs:
                     logger.info(f"👀 Tracked trader seen: {trader_addr[:10]}... {side} in {trade.get('conditionId','')[:12]}...")
 
