@@ -78,14 +78,171 @@ class TradingBot:
             await asyncio.sleep(self._market_refresh_interval)
 
     async def _trader_scan_loop(self):
-        """Periodically scan for profitable traders and copy their positions."""
+        """
+        Two separate jobs:
+        1. Every 60s  — refresh the list of profitable traders (slow, many API calls)
+        2. Every 5s   — poll the live trade feed and copy instantly when a tracked
+                        trader makes a new BUY (must be fast for 5-min markets)
+        """
         await asyncio.sleep(15)  # Wait for market refresh first
+
+        # Start the fast copy-watcher as a separate concurrent task
+        asyncio.create_task(self._copy_watcher_loop())
+
         while self.running:
             try:
                 await self._scan_traders()
             except Exception as e:
                 logger.error(f"Trader scan error: {e}", exc_info=True)
-            await asyncio.sleep(60)  # Scan every minute
+            await asyncio.sleep(60)
+
+    async def _copy_watcher_loop(self):
+        """
+        Polls DATA_API /trades every 5 seconds.
+        When a tracked trader places a new BUY in one of our 4 markets,
+        immediately mirrors it. Uses a seen-set of transactionHashes to
+        avoid double-copying.
+        """
+        await asyncio.sleep(20)  # Let first trader scan complete
+        logger.info("🔍 Copy watcher started (polling every 5s)")
+
+        seen_tx: set[str] = set()
+        # Pre-fill seen_tx with existing trades so we don't copy historical ones
+        seen_tx = await self._init_seen_trades()
+
+        while self.running:
+            try:
+                if self.copy_trade_enabled and self._tracked_traders:
+                    await self._check_new_trades(seen_tx)
+            except Exception as e:
+                logger.error(f"Copy watcher error: {e}", exc_info=True)
+            await asyncio.sleep(5)
+
+    async def _init_seen_trades(self) -> set:
+        """Fetch current trades to use as baseline — we only copy NEW trades after startup."""
+        seen = set()
+        try:
+            condition_ids = self.get_condition_ids()
+            if not condition_ids:
+                return seen
+            async with PolymarketClient() as client:
+                trades = await client.get_market_trades(condition_ids[:4])
+                for t in trades:
+                    tx = t.get("transactionHash") or t.get("id") or ""
+                    if tx:
+                        seen.add(tx)
+            logger.info(f"Copy watcher baseline: {len(seen)} existing trades (will skip these)")
+        except Exception as e:
+            logger.error(f"Error initialising seen trades: {e}")
+        return seen
+
+    async def _check_new_trades(self, seen_tx: set):
+        """
+        Fetch latest trades for our markets. For each new BUY by a tracked trader,
+        immediately place a copy order.
+        """
+        condition_ids = self.get_condition_ids()
+        if not condition_ids:
+            return
+
+        tracked_addrs = {t["address"].lower() for t in self._tracked_traders}
+        open_count = await self._count_open_positions()
+
+        async with PolymarketClient() as client:
+            # Only fetch the most recent 50 trades — we're polling every 5s
+            trades = await client.get_market_trades(condition_ids[:4], limit=50)
+
+            for trade in trades:
+                tx = trade.get("transactionHash") or trade.get("id") or ""
+                if not tx or tx in seen_tx:
+                    continue
+                seen_tx.add(tx)  # Mark as seen regardless of whether we copy
+
+                # Only copy BUYs from tracked traders
+                side = (trade.get("side") or "").upper()
+                if side != "BUY":
+                    continue
+
+                trader_addr = (trade.get("proxyWallet") or "").lower()
+                if trader_addr not in tracked_addrs:
+                    continue
+
+                if open_count >= self.max_open_positions:
+                    logger.info("Max positions reached, skipping copy")
+                    break
+
+                # Find which market this trade is in
+                condition_id = trade.get("conditionId") or ""
+                market_info = next(
+                    (m for m in self._active_markets if m.get("condition_id") == condition_id), None
+                )
+                if not market_info:
+                    continue
+
+                # Get outcome from the asset field — for these markets asset IS the token_id
+                # We need to figure out if this is Up or Down token
+                asset_id = trade.get("asset") or ""
+                outcome, token_id = self._resolve_outcome_from_asset(market_info, asset_id)
+                if not outcome or not token_id:
+                    continue
+
+                # Check we haven't already copied this trader in this market window
+                already = await self._already_copied(trader_addr, condition_id, outcome)
+                if already:
+                    continue
+
+                # Get trader info for logging
+                trader_info = next(
+                    (t for t in self._tracked_traders if t["address"].lower() == trader_addr), {}
+                )
+
+                # Get live price
+                current_price = await client.get_market_price(token_id)
+                if not current_price or current_price <= 0 or current_price >= 1:
+                    logger.warning(f"Bad price {current_price} for {outcome}, skipping")
+                    continue
+
+                direction = outcome.upper()
+                logger.info(
+                    f"🎯 New trade detected! {market_info['asset']} {direction} "
+                    f"by {trader_addr[:10]}... (WR:{trader_info.get('win_rate', 0):.0%}) "
+                    f"— placing copy @ {current_price:.3f}"
+                )
+
+                order_id = await client.place_market_order(
+                    token_id=token_id,
+                    side="BUY",
+                    amount_usdc=self.stake_usdc,
+                    price=current_price,
+                )
+
+                shares = self.stake_usdc / current_price if current_price > 0 else 0
+                await self._record_position(
+                    market_info=market_info,
+                    outcome=outcome,
+                    direction=direction,
+                    stake=self.stake_usdc,
+                    shares=shares,
+                    price=current_price,
+                    order_id=order_id,
+                    copied_from=trader_addr,
+                )
+
+                if order_id:
+                    open_count += 1
+                    await self._notify(
+                        f"📋 <b>Copy Trade Executed</b>\n"
+                        f"{market_info['asset']} {direction} ({market_info['timeframe']})\n"
+                        f"Price: {current_price:.3f} | Stake: ${self.stake_usdc:.2f} USDC\n"
+                        f"Copying: <code>{trader_addr[:12]}...</code> (WR: {trader_info.get('win_rate', 0):.0%})\n"
+                        f"Order: <code>{str(order_id)[:20]}</code>"
+                    )
+                else:
+                    await self._notify(
+                        f"⚠️ <b>Copy Trade Failed</b>\n"
+                        f"{market_info['asset']} {direction} — order returned no ID\n"
+                        f"Check CLOB credentials in Railway env vars."
+                    )
 
     async def _position_monitor_loop(self):
         """Monitor open positions and update PnL."""
@@ -154,11 +311,8 @@ class TradingBot:
             f"Copy trading: {'ENABLED ✅' if self.copy_trade_enabled else 'DISABLED ❌ (use /toggle to enable)'}"
         )
 
-        if self.copy_trade_enabled:
-            logger.info("Checking tracked traders for open positions to copy...")
-            await self._copy_trader_positions(profitable)
-        else:
-            logger.info("Copy trading disabled — skipping position check")
+        # Copy trading is handled by _copy_watcher_loop (polls every 5s)
+        # which reacts to new trades in real-time instead of checking positions
 
     async def _upsert_traders(self, traders: list[dict]):
         async with AsyncSessionLocal() as session:
@@ -184,115 +338,8 @@ class TradingBot:
             await session.commit()
 
     # ──────────────────────────────────────────────
-    # Copy Trading
+    # Copy Trading (handled by _copy_watcher_loop)
     # ──────────────────────────────────────────────
-
-    async def _copy_trader_positions(self, traders: list[dict]):
-        """Check if tracked traders have new positions and copy them."""
-        open_count = await self._count_open_positions()
-        if open_count >= self.max_open_positions:
-            logger.info(f"Max positions ({self.max_open_positions}) reached, skipping copy")
-            return
-
-        condition_ids = self.get_condition_ids()
-
-        async with PolymarketClient() as client:
-            for trader in traders:
-                if open_count >= self.max_open_positions:
-                    break
-
-                positions = await client.get_trader_open_positions(
-                    trader["address"], condition_ids
-                )
-                logger.debug(f"Trader {trader['address'][:10]}... has {len(positions)} open positions in our markets")
-
-                for pos in positions:
-                    # Data API positions use conditionId
-                    condition_id = pos.get("conditionId") or pos.get("market") or ""
-                    outcome = pos.get("outcome") or ""  # "Up" or "Down"
-                    price = float(pos.get("price") or pos.get("currentPrice") or 0)
-                    size = float(pos.get("size") or 0)
-
-                    if not condition_id or not outcome or price <= 0 or size <= 0:
-                        continue
-
-                    # Find matching market by conditionId
-                    market_info = next(
-                        (m for m in self._active_markets if m.get("condition_id") == condition_id), None
-                    )
-                    if not market_info:
-                        logger.debug(f"conditionId {condition_id[:16]}... not in active markets")
-                        continue
-
-                    # Check if we already have an open copy of this position
-                    already_copied = await self._already_copied(
-                        trader["address"], condition_id, outcome
-                    )
-                    if already_copied:
-                        continue
-
-                    # Map outcome to token_id
-                    # Tokens are {"outcome": "Up", "token_id": "..."} or {"outcome": "Yes", ...}
-                    token_id = self._get_token_id(market_info, outcome)
-                    if not token_id:
-                        # Log what tokens are available to help debug
-                        available = [(t.get("outcome"), t.get("token_id","")[:12]) for t in market_info.get("tokens", [])]
-                        logger.warning(f"No token_id for outcome '{outcome}' in {market_info['asset']} {market_info['timeframe']}. Available: {available}")
-                        continue
-
-                    # Get current best price from orderbook
-                    current_price = await client.get_market_price(token_id)
-                    trade_price = current_price or price
-                    if not trade_price or trade_price <= 0 or trade_price >= 1:
-                        logger.warning(f"Skipping trade: invalid price {trade_price}")
-                        continue
-
-                    # Direction = outcome name for these markets (Up/Down)
-                    direction = outcome.upper()  # "UP" or "DOWN"
-
-                    logger.info(
-                        f"Placing copy trade: {market_info['asset']} {direction} "
-                        f"@ {trade_price:.3f} | ${self.stake_usdc} USDC | "
-                        f"copying {trader['address'][:10]}... (WR:{trader['win_rate']:.0%})"
-                    )
-
-                    order_id = await client.place_market_order(
-                        token_id=token_id,
-                        side="BUY",
-                        amount_usdc=self.stake_usdc,
-                        price=trade_price,
-                    )
-
-                    shares = self.stake_usdc / trade_price if trade_price > 0 else 0
-                    await self._record_position(
-                        market_info=market_info,
-                        outcome=outcome,
-                        direction=direction,
-                        stake=self.stake_usdc,
-                        shares=shares,
-                        price=trade_price,
-                        order_id=order_id,
-                        copied_from=trader["address"],
-                    )
-
-                    if order_id:
-                        open_count += 1
-                        logger.info(f"✅ Order placed: {order_id}")
-                        await self._notify(
-                            f"📋 <b>Copy Trade Executed</b>\n"
-                            f"Market: {market_info['asset']} {direction} ({market_info['timeframe']})\n"
-                            f"Price: {trade_price:.3f} | Stake: ${self.stake_usdc:.2f} USDC\n"
-                            f"Shares: ~{shares:.1f}\n"
-                            f"Copying: <code>{trader['address'][:12]}...</code> (WR: {trader['win_rate']:.0%})\n"
-                            f"Order ID: <code>{str(order_id)[:20]}</code>"
-                        )
-                    else:
-                        logger.warning("Order placement returned no ID — check CLOB credentials")
-                        await self._notify(
-                            f"⚠️ <b>Copy Trade Failed</b>\n"
-                            f"{market_info['asset']} {direction} ({market_info['timeframe']})\n"
-                            f"Order placement returned no ID. Check CLOB API credentials."
-                        )
 
     def _get_token_id(self, market_info: dict, outcome: str) -> Optional[str]:
         tokens = market_info.get("tokens", [])
@@ -300,6 +347,19 @@ class TradingBot:
             if (token.get("outcome") or "").lower() == outcome.lower():
                 return token.get("token_id")
         return None
+
+    def _resolve_outcome_from_asset(self, market_info: dict, asset_id: str) -> tuple[str, str]:
+        """
+        Given a trade's asset field (which is the token_id on Polymarket),
+        find the matching outcome name ("Up"/"Down") and token_id.
+        Returns (outcome, token_id) or ("", "") if not found.
+        """
+        tokens = market_info.get("tokens", [])
+        for token in tokens:
+            tid = token.get("token_id") or ""
+            if tid == asset_id:
+                return token.get("outcome", ""), tid
+        return "", ""
 
     async def _already_copied(self, trader_addr: str, condition_id: str, outcome: str) -> bool:
         """Check if we already have an open copy of this trader's position in this market."""
