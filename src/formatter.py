@@ -2,8 +2,8 @@
 Formatter — renders data into clean Telegram Markdown messages.
 """
 
-from scorer import LeaderboardEntry
-from signals import Signal
+from src.scorer import LeaderboardEntry
+from src.signals import Signal
 
 
 def format_leaderboard(entries: list[LeaderboardEntry]) -> str:
@@ -59,10 +59,8 @@ def format_signals(signals: list[Signal]) -> str:
     lines = ["📡 *Active Signals*\n", "_Markets where sharp wallets independently agree_\n"]
 
     for i, sig in enumerate(signals, 1):
-        # Direction emoji
         direction = "🟢" if sig.outcome == "YES" else "🔴"
 
-        # Strength indicator
         if sig.num_wallets >= 4:
             strength = "🔥 STRONG"
         elif sig.num_wallets == 3:
@@ -70,7 +68,6 @@ def format_signals(signals: list[Signal]) -> str:
         else:
             strength = "👀 WATCH"
 
-        # Price display
         price_pct = sig.avg_price * 100
         implied_odds = f"{price_pct:.0f}¢"
 
