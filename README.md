@@ -1,193 +1,138 @@
-# 🤖 Polymarket Trading Bot
+# PolySharp 👁 — Polymarket Wallet Intelligence Bot
 
-A copy-trading bot for Polymarket's BTC/ETH 5-minute and 15-minute up/down markets. Tracks profitable traders and mirrors their positions. Controlled entirely via Telegram, deployed on Railway.
+A Telegram bot that scores Polymarket wallets by **accuracy** (not PnL), identifies the top 3% of "sharp" wallets, and surfaces markets where they independently converge.
+
+---
+
+## How It Works
+
+### Scoring Logic
+Wallets are scored like free throws:
+- We pull the top 100 wallets from Polymarket's leaderboard (by PnL + volume)
+- For each wallet, we fetch their trade history
+- We evaluate whether their conviction trades (buying below fair value) resolved in their favour
+- Accuracy is measured against a **50% baseline** (random chance on binary markets)
+- A **Wilson score** adjusts for sample size — a wallet hitting 70% on 5 trades ranks lower than one hitting 68% on 100 trades
+- The top ~3% who consistently beat the baseline are labelled **sharp**
+
+### Signal Logic
+A signal fires when:
+1. 2+ sharp wallets are independently holding the same side of a market
+2. Their combined confidence score exceeds the threshold
+
+One wallet could be wrong. When the sharpest wallets all agree without coordinating, that's a signal.
+
+---
+
+## Commands
+
+| Command | Description |
+|---|---|
+| `/start` | Main menu |
+| `/signals` | Markets where sharp wallets converge |
+| `/leaderboard` | Top wallets ranked by accuracy score |
+| `/help` | Help text |
+
+---
+
+## Setup
+
+### 1. Create a Telegram Bot
+1. Message [@BotFather](https://t.me/botfather) on Telegram
+2. Send `/newbot` and follow the prompts
+3. Copy your bot token
+
+### 2. Local Development
+
+```bash
+# Clone / download the project
+cd polymarket-bot
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Set your bot token
+cp .env.example .env
+# Edit .env and add your TELEGRAM_BOT_TOKEN
+
+# Run locally
+python bot.py
+```
+
+> **Note:** For local development with `.env` files, install `python-dotenv` and add `from dotenv import load_dotenv; load_dotenv()` at the top of `bot.py`.
+
+---
+
+## Deploy to Railway
+
+### 1. Push to GitHub
+```bash
+git init
+git add .
+git commit -m "Initial PolySharp bot"
+git remote add origin https://github.com/yourusername/polymarket-bot.git
+git push -u origin main
+```
+
+### 2. Create Railway Project
+1. Go to [railway.app](https://railway.app) and sign in
+2. Click **New Project → Deploy from GitHub repo**
+3. Select your repository
+4. Railway auto-detects Python via `nixpacks.toml`
+
+### 3. Set Environment Variables
+In your Railway project dashboard:
+- Go to your service → **Variables**
+- Add: `TELEGRAM_BOT_TOKEN` = `your_bot_token_here`
+
+### 4. Deploy
+Railway deploys automatically on every push to `main`. The bot runs 24/7.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  Telegram Bot   │────▶│  Trading Engine  │────▶│ Polymarket CLOB │
-│  (Control UI)   │◀────│  (bot_engine.py) │◀────│    (Orders)     │
-└─────────────────┘     └──────────────────┘     └─────────────────┘
-                                │
-                         ┌──────▼──────┐
-                         │  SQLite DB  │
-                         │ (positions, │
-                         │  traders)   │
-                         └─────────────┘
+bot.py              — Telegram handlers, command routing
+src/
+  scorer.py         — Fetches wallet trades, scores by accuracy
+  signals.py        — Finds markets with sharp wallet consensus
+  formatter.py      — Renders clean Telegram Markdown output
 ```
 
-**How it works:**
-1. Every 5 minutes: fetches active BTC/ETH short-term markets from Polymarket Gamma API
-2. Every 60 seconds: scans recent trades across those markets, finds traders with ≥60% win rate and ≥20 trades
-3. If copy trading is enabled: detects when top traders open a new position, mirrors it with your configured stake
-4. Monitors positions and notifies you on close with PnL
+### Data Sources (all public, no auth required)
+| Endpoint | Used For |
+|---|---|
+| `data-api.polymarket.com/v1/leaderboard` | Seed wallet list |
+| `data-api.polymarket.com/trades` | Trade history per wallet |
+| `data-api.polymarket.com/positions` | Current open positions |
+
+### Caching
+- Wallet scores are cached for **5 minutes**
+- Signals are cached for **3 minutes**
+
+This keeps API calls reasonable while staying fresh.
 
 ---
 
-## Prerequisites
+## Improving Accuracy
 
-- Python 3.11+
-- A Polymarket account with USDC on Polygon
-- Polymarket API credentials (from polymarket.com/settings)
-- A Telegram bot token (from @BotFather)
-- A Railway account (railway.app)
+The current scorer uses a **price-movement heuristic** to approximate win/loss on trades (since Polymarket's public API doesn't expose resolution status directly in trade history). 
 
----
+To improve this:
+1. Cross-reference the `gamma-api.polymarket.com/markets` endpoint to get `resolved` status and `resolutionValue`
+2. Match trade `conditionId` to resolved markets
+3. Check if the wallet bought YES on a YES-resolved market (or NO on a NO-resolved market)
 
-## Setup
-
-### 1. Clone & install
-
-```bash
-git clone <your-repo>
-cd polymarket-bot
-pip install -r requirements.txt
-```
-
-### 2. Get Polymarket API Keys
-
-1. Go to [polymarket.com](https://polymarket.com) → Settings → API
-2. Create a new API key → copy Key, Secret, Passphrase
-3. Export your wallet private key (the EVM wallet connected to Polymarket)
-   - MetaMask: Account Details → Export Private Key
-
-### 3. Create Telegram Bot
-
-1. Message [@BotFather](https://t.me/BotFather) on Telegram
-2. `/newbot` → follow prompts → copy the token
-3. Get your Telegram user ID: message [@userinfobot](https://t.me/userinfobot)
-
-### 4. Configure environment
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env`:
-```env
-TELEGRAM_BOT_TOKEN=1234567890:ABCdef...
-ALLOWED_CHAT_IDS=your_telegram_user_id
-
-POLYMARKET_API_KEY=...
-POLYMARKET_API_SECRET=...
-POLYMARKET_API_PASSPHRASE=...
-POLYMARKET_PRIVATE_KEY=0x...
-POLYMARKET_WALLET_ADDRESS=0x...
-
-DEFAULT_STAKE_USDC=5.0
-MAX_STAKE_USDC=50.0
-MAX_OPEN_POSITIONS=5
-MIN_TRADER_WIN_RATE=0.60
-MIN_TRADER_TRADES=20
-```
-
-### 5. Run locally
-
-```bash
-python main.py
-```
+This would give you exact accuracy numbers instead of heuristics.
 
 ---
 
-## Deploy to Railway
+## Rate Limits
 
-### Option A: GitHub (recommended)
+Polymarket's public APIs are unauthenticated but rate-limited. The bot uses:
+- `asyncio.Semaphore(5)` — max 5 concurrent requests
+- 5-minute cache on wallet scores
+- 3-minute cache on signals
 
-1. Push this repo to GitHub
-2. Go to [railway.app](https://railway.app) → New Project → Deploy from GitHub
-3. Select your repo
-4. Go to **Variables** tab → add all your `.env` values
-5. Railway auto-detects Python and deploys
-
-### Option B: Railway CLI
-
-```bash
-npm install -g @railway/cli
-railway login
-railway init
-railway up
-railway variables set TELEGRAM_BOT_TOKEN=... POLYMARKET_API_KEY=... # etc
-```
-
-### Persistent storage on Railway
-
-The bot uses SQLite by default. For Railway, add a **Volume**:
-1. Railway dashboard → your service → **Volumes** → Add Volume
-2. Mount path: `/data`
-3. Update your env: `DATABASE_URL=sqlite+aiosqlite:////data/bot_data.db`
-
----
-
-## Telegram Commands
-
-| Command | Description |
-|---------|-------------|
-| `/start` | Main control panel with buttons |
-| `/stats` | Performance stats (PnL, win rate, open positions) |
-| `/positions` | List all open positions with unrealized PnL |
-| `/traders` | Top tracked profitable traders |
-| `/markets` | Active BTC/ETH markets being watched |
-| `/stake <amount>` | Set stake per trade (e.g. `/stake 10`) |
-| `/toggle` | Toggle copy trading on/off |
-| `/startbot` | Start the trading engine |
-| `/stopbot` | Stop the trading engine |
-| `/help` | Show all commands |
-
----
-
-## Configuration Reference
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DEFAULT_STAKE_USDC` | `5.0` | USDC per copy trade |
-| `MAX_STAKE_USDC` | `50.0` | Max allowed stake (safety limit) |
-| `MAX_OPEN_POSITIONS` | `5` | Max concurrent positions |
-| `MIN_TRADER_WIN_RATE` | `0.60` | Min win rate to follow (60%) |
-| `MIN_TRADER_TRADES` | `20` | Min historical trades to qualify |
-| `TOP_TRADERS_TO_TRACK` | `10` | Number of traders to monitor |
-| `MARKET_REFRESH_INTERVAL` | `300` | Market refresh in seconds |
-| `COPY_TRADE_ENABLED` | `false` | Auto-enable copy trading on start |
-| `AUTO_START_BOT` | `true` | Auto-start engine on launch |
-
----
-
-## Risk Warning
-
-⚠️ **This bot trades real money. Polymarket prediction markets are highly volatile, especially short-term crypto markets.**
-
-- Start with a small stake ($1–$5) to test
-- Monitor closely for the first few days
-- Past profitable traders don't guarantee future returns
-- Keep `MAX_OPEN_POSITIONS` and `MAX_STAKE_USDC` conservative
-- Never fund more than you're willing to lose
-
----
-
-## File Structure
-
-```
-polymarket-bot/
-├── main.py              # Entry point
-├── src/
-│   ├── bot_engine.py    # Core trading logic
-│   ├── polymarket.py    # Polymarket API client
-│   ├── telegram_bot.py  # Telegram interface
-│   └── database.py      # SQLAlchemy models
-├── requirements.txt
-├── railway.toml         # Railway deployment config
-├── .env.example
-└── README.md
-```
-
----
-
-## Troubleshooting
-
-**Bot doesn't find markets:** Polymarket's short-term crypto markets come and go. Check polymarket.com to confirm 5min/15min markets are currently active.
-
-**Orders failing:** Ensure your wallet has USDC on Polygon, not Ethereum mainnet. Also verify API credentials are correct in the CLOB settings.
-
-**Telegram not responding:** Check `ALLOWED_CHAT_IDS` — your Telegram user ID must be in the list.
+If you hit rate limits, increase cache TTLs in `scorer.py` and `signals.py`.
