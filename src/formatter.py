@@ -2,8 +2,8 @@
 Formatter — renders data into clean Telegram Markdown messages.
 """
 
-from src.scorer import LeaderboardEntry
-from src.signals import Signal
+from scorer import LeaderboardEntry
+from signals import Signal
 
 
 def format_leaderboard(entries: list[LeaderboardEntry]) -> str:
@@ -29,12 +29,15 @@ def format_leaderboard(entries: list[LeaderboardEntry]) -> str:
         bar = "█" * bar_len + "░" * (10 - bar_len)
 
         pnl_str = f"+${w.pnl:,.0f}" if w.pnl >= 0 else f"-${abs(w.pnl):,.0f}"
+        short_addr = w.address[:6] + "..." + w.address[-4:]
+        profile_url = f"https://polymarket.com/profile/{w.address}"
 
         lines.append(
             f"{rank_icon} *{name}*\n"
             f"   Accuracy: `{w.accuracy_pct}` ({w.correct_trades}/{w.total_trades} calls)\n"
             f"   Edge: `{bar}` {w.confidence_score:.3f}\n"
             f"   PnL: `{pnl_str}` | Vol: `${w.vol:,.0f}`\n"
+            f"   Wallet: `{short_addr}` — [View Profile]({profile_url})\n"
         )
 
     lines.append(
